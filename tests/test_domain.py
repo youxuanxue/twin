@@ -47,6 +47,19 @@ def valid_goal_and_plan() -> dict[str, object]:
     }
 
 
+def tree_snapshot(root: Path) -> dict[str, tuple[str, bytes]]:
+    snapshot: dict[str, tuple[str, bytes]] = {}
+    for path in sorted(root.rglob("*")):
+        relative = str(path.relative_to(root))
+        if path.is_symlink():
+            snapshot[relative] = ("symlink", os.readlink(path).encode("utf-8"))
+        elif path.is_dir():
+            snapshot[relative] = ("directory", b"")
+        else:
+            snapshot[relative] = ("file", path.read_bytes())
+    return snapshot
+
+
 class TwinServiceTest(TestCase):
     def setUp(self) -> None:
         self.tempdir = TemporaryDirectory()
@@ -71,6 +84,13 @@ class TwinServiceTest(TestCase):
             action["workspace"], "host/codex", action["state_revision"], action["action_token"],
             run_id, {"updates": updates},
         )
+
+    @staticmethod
+    def workspace_snapshot(workspace: Path) -> dict[str, bytes]:
+        return {
+            relative: (workspace / relative).read_bytes()
+            for relative in ("goal.yaml", "plan.yaml", "state.json", "events.jsonl")
+        }
 
     def test_start_returns_author_plan_action(self) -> None:
         action = self.service.start("ship feature", self.repo, "host/codex")
@@ -273,9 +293,9 @@ class TwinServiceTest(TestCase):
             store = WorkspaceStore(TwinPaths.for_home(root / "home"))
             service = TwinService(store)
 
-            def crash_after_first_publish(staged, previous, state_path):
+            def crash_after_first_publish(staged, previous, state_path, transaction_fd):
                 target = next(target for target in staged if target != state_path)
-                os.replace(staged[target], target)
+                os.replace(staged[target], target, src_dir_fd=transaction_fd)
                 os._exit(79)
 
             store._publish_staged = crash_after_first_publish
@@ -304,12 +324,12 @@ class TwinServiceTest(TestCase):
         original_stage = self.store._stage_bytes
         calls = 0
 
-        def fail_second_stage(target: Path, body: bytes) -> Path:
+        def fail_second_stage(transaction_fd: int, name: str, body: bytes) -> str:
             nonlocal calls
             calls += 1
             if calls == 2:
                 raise OSError("second staging failure")
-            return original_stage(target, body)
+            return original_stage(transaction_fd, name, body)
 
         with patch.object(self.store, "_stage_bytes", side_effect=fail_second_stage):
             with self.assertRaisesRegex(OSError, "second staging failure"):
@@ -318,6 +338,154 @@ class TwinServiceTest(TestCase):
                 )
         self.assertEqual(list(workspace.rglob("*.tmp")), [])
         self.assertFalse((workspace / ".transactions").exists())
+
+    def test_preexisting_transaction_root_symlink_fails_before_any_action_mutation(self) -> None:
+        action = self.service.start("ship feature", self.repo, "host/codex")
+        workspace = self.store.resolve(str(action["workspace"]), self.repo)
+        outside = Path(self.tempdir.name) / "outside-root-symlink"
+        outside.mkdir()
+        (outside / "sentinel.bin").write_bytes(b"outside must remain byte-identical")
+        before_workspace = self.workspace_snapshot(workspace)
+        before_outside = tree_snapshot(outside)
+        (workspace / ".transactions").symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaises(ValueError):
+            self.service.submit_plan(
+                action["workspace"], "host/codex", action["state_revision"],
+                action["action_token"], valid_goal_and_plan(),
+            )
+
+        self.assertEqual(tree_snapshot(outside), before_outside)
+        self.assertEqual(self.workspace_snapshot(workspace), before_workspace)
+        self.assertFalse((workspace / ".transaction.json").exists())
+        (workspace / ".transactions").unlink()
+        self.assertEqual(
+            self.service.submit_plan(
+                action["workspace"], "host/codex", action["state_revision"],
+                action["action_token"], valid_goal_and_plan(),
+            )["status"],
+            "ready",
+        )
+
+    def test_preexisting_transaction_root_file_fails_before_any_action_mutation(self) -> None:
+        action = self.service.start("ship feature", self.repo, "host/codex")
+        workspace = self.store.resolve(str(action["workspace"]), self.repo)
+        transaction_root = workspace / ".transactions"
+        transaction_root.write_bytes(b"foreign namespace entry")
+        before_workspace = self.workspace_snapshot(workspace)
+
+        with self.assertRaises((OSError, ValueError)):
+            self.service.submit_plan(
+                action["workspace"], "host/codex", action["state_revision"],
+                action["action_token"], valid_goal_and_plan(),
+            )
+
+        self.assertEqual(transaction_root.read_bytes(), b"foreign namespace entry")
+        self.assertEqual(self.workspace_snapshot(workspace), before_workspace)
+        self.assertFalse((workspace / ".transaction.json").exists())
+        transaction_root.unlink()
+        self.assertEqual(
+            self.service.submit_plan(
+                action["workspace"], "host/codex", action["state_revision"],
+                action["action_token"], valid_goal_and_plan(),
+            )["status"],
+            "ready",
+        )
+
+    def test_preexisting_transaction_child_symlink_fails_before_any_action_mutation(self) -> None:
+        action = self.service.start("ship feature", self.repo, "host/codex")
+        workspace = self.store.resolve(str(action["workspace"]), self.repo)
+        outside = Path(self.tempdir.name) / "outside-child-symlink"
+        outside.mkdir()
+        (outside / "sentinel.bin").write_bytes(b"outside must remain byte-identical")
+        before_workspace = self.workspace_snapshot(workspace)
+        before_outside = tree_snapshot(outside)
+        transaction_id = "a" * 32
+        transaction_root = workspace / ".transactions"
+        original_mkdir = os.mkdir
+        injected = False
+
+        def inject_child_after_root_creation(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> None:
+            nonlocal injected
+            if dir_fd is None:
+                original_mkdir(path, mode)
+            else:
+                original_mkdir(path, mode, dir_fd=dir_fd)
+            if not injected and (
+                Path(path) == transaction_root
+                or dir_fd is not None and path == ".transactions"
+            ):
+                injected = True
+                (transaction_root / transaction_id).symlink_to(outside, target_is_directory=True)
+
+        with patch("twin.storage.workspaces.secrets.token_hex", return_value=transaction_id):
+            with patch("twin.storage.workspaces.os.mkdir", side_effect=inject_child_after_root_creation):
+                with self.assertRaises((OSError, ValueError)):
+                    self.service.submit_plan(
+                        action["workspace"], "host/codex", action["state_revision"],
+                        action["action_token"], valid_goal_and_plan(),
+                    )
+
+        self.assertEqual(tree_snapshot(outside), before_outside)
+        self.assertEqual(self.workspace_snapshot(workspace), before_workspace)
+        self.assertFalse((workspace / ".transaction.json").exists())
+        (transaction_root / transaction_id).unlink()
+        transaction_root.rmdir()
+        self.assertEqual(
+            self.service.submit_plan(
+                action["workspace"], "host/codex", action["state_revision"],
+                action["action_token"], valid_goal_and_plan(),
+            )["status"],
+            "ready",
+        )
+
+    def test_transaction_root_swap_before_first_stage_never_writes_through_symlink(self) -> None:
+        action = self.service.start("ship feature", self.repo, "host/codex")
+        workspace = self.store.resolve(str(action["workspace"]), self.repo)
+        outside = Path(self.tempdir.name) / "outside-root-swap"
+        outside.mkdir()
+        (outside / "sentinel.bin").write_bytes(b"outside must remain byte-identical")
+        before_workspace = self.workspace_snapshot(workspace)
+        before_outside = tree_snapshot(outside)
+        transaction_root = workspace / ".transactions"
+        held_root = workspace / ".transactions-held"
+        original_write_json = self.store._write_json
+
+        def swap_after_journal(path: Path, value: object) -> None:
+            original_write_json(path, value)
+            if path.name == ".transaction.json":
+                if transaction_root.exists():
+                    transaction_root.rename(held_root)
+                transaction_root.symlink_to(outside, target_is_directory=True)
+
+        with patch.object(self.store, "_write_json", side_effect=swap_after_journal):
+            with self.assertRaises((OSError, ValueError)):
+                self.service.submit_plan(
+                    action["workspace"], "host/codex", action["state_revision"],
+                    action["action_token"], valid_goal_and_plan(),
+                )
+
+        self.assertEqual(tree_snapshot(outside), before_outside)
+        self.assertEqual(self.workspace_snapshot(workspace), before_workspace)
+        self.assertTrue((workspace / ".transaction.json").is_file())
+        self.assertNotEqual(list(held_root.rglob("*.stage")), [])
+        transaction_root.unlink()
+        if held_root.exists():
+            held_root.rename(transaction_root)
+        self.assertEqual(self.store.load_state(workspace)["state_revision"], action["state_revision"])
+        self.assertFalse((workspace / ".transaction.json").exists())
+        self.assertEqual(
+            self.service.submit_plan(
+                action["workspace"], "host/codex", action["state_revision"],
+                action["action_token"], valid_goal_and_plan(),
+            )["status"],
+            "ready",
+        )
 
     def test_respond_publish_failure_leaves_no_artifact_event_or_state_drift(self) -> None:
         human = self._needs_human_workspace()
@@ -362,7 +530,14 @@ class TwinServiceTest(TestCase):
         for transaction_id, victim in cases:
             with self.subTest(transaction_id=transaction_id):
                 (workspace / ".transaction.json").write_text(
-                    json.dumps({"schema_version": 1, "transaction_id": transaction_id, "targets": [], "created_directories": []}),
+                    json.dumps({
+                        "schema_version": 2,
+                        "transaction_id": transaction_id,
+                        "transaction_root_identity": {"device": 0, "inode": 0},
+                        "transaction_identity": {"device": 0, "inode": 0},
+                        "targets": [],
+                        "created_directories": [],
+                    }),
                     encoding="utf-8",
                 )
                 with self.assertRaisesRegex(ValueError, "invalid transaction journal"):
@@ -376,7 +551,14 @@ class TwinServiceTest(TestCase):
         for transaction_id in ("g" * 32, "a" * 31):
             with self.subTest(transaction_id=transaction_id):
                 (workspace / ".transaction.json").write_text(
-                    json.dumps({"schema_version": 1, "transaction_id": transaction_id, "targets": [], "created_directories": []}),
+                    json.dumps({
+                        "schema_version": 2,
+                        "transaction_id": transaction_id,
+                        "transaction_root_identity": {"device": 0, "inode": 0},
+                        "transaction_identity": {"device": 0, "inode": 0},
+                        "targets": [],
+                        "created_directories": [],
+                    }),
                     encoding="utf-8",
                 )
                 with self.assertRaisesRegex(ValueError, "invalid transaction journal"):
@@ -387,9 +569,25 @@ class TwinServiceTest(TestCase):
         victim.mkdir()
         transaction_root = workspace / ".transactions"
         transaction_root.mkdir()
-        (transaction_root / transaction_id).symlink_to(victim, target_is_directory=True)
+        transaction = transaction_root / transaction_id
+        transaction.symlink_to(victim, target_is_directory=True)
+        root_status = transaction_root.stat()
+        transaction_status = transaction.lstat()
         (workspace / ".transaction.json").write_text(
-            json.dumps({"schema_version": 1, "transaction_id": transaction_id, "targets": [], "created_directories": []}),
+            json.dumps({
+                "schema_version": 2,
+                "transaction_id": transaction_id,
+                "transaction_root_identity": {
+                    "device": root_status.st_dev,
+                    "inode": root_status.st_ino,
+                },
+                "transaction_identity": {
+                    "device": transaction_status.st_dev,
+                    "inode": transaction_status.st_ino,
+                },
+                "targets": [],
+                "created_directories": [],
+            }),
             encoding="utf-8",
         )
         with self.assertRaisesRegex(ValueError, "invalid transaction journal"):
@@ -405,11 +603,11 @@ class TwinServiceTest(TestCase):
                 with self.assertRaisesRegex(ValueError, "artifact path is reserved"):
                     self.store.write_artifact(workspace, relative, b"blocked")
 
-    def test_rmtree_cleanup_failure_retains_journal_for_later_recovery(self) -> None:
+    def test_transaction_entry_cleanup_failure_retains_journal_for_later_recovery(self) -> None:
         action = self.service.start("ship feature", self.repo, "host/codex")
         workspace = self.store.resolve(str(action["workspace"]), self.repo)
         before = {name: (workspace / name).read_bytes() for name in ("goal.yaml", "plan.yaml", "state.json", "events.jsonl")}
-        with patch("twin.storage.workspaces.shutil.rmtree", return_value=None):
+        with patch.object(self.store, "_remove_transaction_directory", return_value=None):
             with self.assertRaisesRegex(OSError, "transaction staging cleanup"):
                 self.service.submit_plan(
                     action["workspace"], "host/codex", action["state_revision"], action["action_token"], valid_goal_and_plan()
