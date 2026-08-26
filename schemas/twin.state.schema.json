@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/youxuanxue/twin/schemas/twin.state.schema.json",
+  "title": "Twin state",
+  "type": "object",
+  "required": ["schema_version", "workspace_id", "status", "state_revision", "supervisor_route", "pending_action"],
+  "properties": {
+    "schema_version": {"const": 1}, "workspace_id": {"type": "string", "minLength": 1},
+    "status": {"type": "string", "enum": ["awaiting_plan", "ready", "worker_running", "review_required", "needs_human", "accepted_done", "failed"]},
+    "state_revision": {"type": "integer", "minimum": 0}, "supervisor_route": {"type": ["string", "null"]},
+    "pending_action": {"type": ["object", "null"], "additionalProperties": false, "properties": {"kind": {"type": "string"}, "state_revision": {"type": "integer", "minimum": 0}, "route": {"type": "string"}, "token_hash": {"type": "string"}, "run_id": {"type": ["string", "null"]}}},
+    "current_run_id": {"type": ["string", "null"]}, "current_item_id": {"type": ["string", "null"]}, "terminal_summary": {"type": ["string", "null"]},
+    "metadata": {"type": "object", "maxProperties": 16, "additionalProperties": {"type": ["string", "number", "boolean", "null"]}}
+  }, "additionalProperties": false
+}
