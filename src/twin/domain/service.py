@@ -11,15 +11,30 @@ from twin.domain.evidence import evidence_exists
 from twin.domain.plan import apply_updates, choose_next_item, completion_gaps, validate_plan
 from twin.domain.state import require_mutable, transition
 from twin.resources import ResourceCatalog
+from twin.runtime.protocols import (
+    WorkerRuntime,
+    WorkerTurnRequest,
+    WorkerTurnResult,
+    WorkspaceIsolation,
+)
 from twin.schema import validate_document
 from twin.storage.workspaces import WorkspaceStore
 from twin.yaml_codec import encode_yaml, load_yaml
 
 
 class TwinService:
-    def __init__(self, store: WorkspaceStore, runtime: Callable[[dict[str, object]], object] | None = None) -> None:
+    def __init__(
+        self,
+        store: WorkspaceStore,
+        runtime: WorkerRuntime | Callable[[dict[str, object]], object] | None = None,
+        isolation: WorkspaceIsolation | None = None,
+        *,
+        timeout_seconds: float = 300,
+    ) -> None:
         self.store = store
         self.runtime = runtime
+        self.isolation = isolation
+        self.timeout_seconds = timeout_seconds
         self.resources = ResourceCatalog(Path(__file__).resolve().parents[3])
 
     def start(self, goal: str, repo_root: Path, route: str) -> dict[str, object]:
@@ -53,6 +68,15 @@ class TwinService:
         )
         self.store.replace_state(workspace, self._revision(state), state)
         if self.runtime is not None:
+            if hasattr(self.runtime, "run_turn"):
+                return self._run_worker_runtime(
+                    workspace=workspace,
+                    repo_root=repo_root,
+                    route=route,
+                    action=action,
+                    run_id=run_id,
+                    item_id=item["id"],
+                )
             self.runtime(action)
         return action
 
@@ -247,6 +271,151 @@ class TwinService:
 
     def _result(self, workspace: Path, state: dict[str, object]) -> dict[str, object]:
         return {"workspace": str(state["workspace_id"]), "status": state["status"], "state_revision": state["state_revision"], "supervisor_route": state["supervisor_route"]}
+
+    def _run_worker_runtime(
+        self,
+        *,
+        workspace: Path,
+        repo_root: Path,
+        route: str,
+        action: dict[str, object],
+        run_id: str,
+        item_id: str,
+    ) -> dict[str, object]:
+        workspace_id = str(action["workspace"])
+        cwd = repo_root.expanduser().resolve()
+        cleanup_result: bool | None = None
+        cleanup_error: str | None = None
+        if self.isolation is not None:
+            cwd = self.isolation.prepare(cwd, workspace_id)
+        request = WorkerTurnRequest(
+            prompt=self._worker_prompt(workspace, action),
+            cwd=cwd,
+            provider=self._provider_from_route(route),
+            session_id="",
+            timeout_seconds=self.timeout_seconds,
+            environment={},
+        )
+        assert self.runtime is not None and hasattr(self.runtime, "run_turn")
+        try:
+            result = self.runtime.run_turn(request)  # type: ignore[union-attr]
+        except Exception as exc:
+            result = WorkerTurnResult(
+                output_text=f"runtime failed: {exc}",
+                returncode=1,
+                session_id=request.session_id,
+                events=({"event": "failure", "failure_kind": "runtime_exception", "error": str(exc)},),
+            )
+        finally:
+            if self.isolation is not None:
+                try:
+                    cleanup_result = self.isolation.cleanup(repo_root.expanduser().resolve(), workspace_id)
+                except Exception as exc:
+                    cleanup_result = False
+                    cleanup_error = str(exc)
+        self._persist_runtime_evidence(
+            workspace=workspace,
+            run_id=run_id,
+            item_id=item_id,
+            request=request,
+            result=result,
+            cleanup_result=cleanup_result,
+            cleanup_error=cleanup_error,
+        )
+        state = self._state(workspace)
+        state["pending_action"] = None
+        transition(state, "review_required")
+        review_action = issue_action(
+            state,
+            kind="review",
+            workspace=workspace_id,
+            route=route,
+            run_id=run_id,
+        )
+        self.store.replace_state(workspace, self._revision(state), state)
+        return review_action
+
+    def _worker_prompt(self, workspace: Path, action: dict[str, object]) -> str:
+        persona = self.resources.persona("worker").read_text(encoding="utf-8")
+        goal = (workspace / "goal.yaml").read_text(encoding="utf-8")
+        plan = (workspace / "plan.yaml").read_text(encoding="utf-8")
+        return "\n\n".join((
+            persona,
+            "## Twin action",
+            json.dumps(action, ensure_ascii=False, indent=2, sort_keys=True),
+            "## goal.yaml",
+            goal,
+            "## plan.yaml",
+            plan,
+        ))
+
+    def _persist_runtime_evidence(
+        self,
+        *,
+        workspace: Path,
+        run_id: str,
+        item_id: str,
+        request: WorkerTurnRequest,
+        result: WorkerTurnResult,
+        cleanup_result: bool | None,
+        cleanup_error: str | None,
+    ) -> None:
+        base = f"runs/{run_id}"
+        request_metadata = self.store.write_artifact(
+            workspace,
+            f"{base}/request.json",
+            self._json_bytes({
+                "prompt": request.prompt,
+                "cwd": str(request.cwd),
+                "provider": request.provider,
+                "session_id": request.session_id,
+                "timeout_seconds": request.timeout_seconds,
+                "environment": dict(request.environment),
+            }),
+        )
+        result_metadata = self.store.write_artifact(
+            workspace,
+            f"{base}/result.json",
+            self._json_bytes({
+                "output_text": result.output_text,
+                "returncode": result.returncode,
+                "session_id": result.session_id,
+                "events": list(result.events),
+                "timed_out": result.timed_out,
+            }),
+        )
+        evidence = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "item_id": item_id,
+            "request": {"metadata": {
+                "provider": request.provider,
+                "cwd": str(request.cwd),
+                "timeout_seconds": request.timeout_seconds,
+            }},
+            "result": {"metadata": {
+                "returncode": result.returncode,
+                "session_id": result.session_id,
+                "timed_out": result.timed_out,
+                "cleanup": cleanup_result,
+                "cleanup_error": cleanup_error,
+            }},
+            "evidence": [request_metadata, result_metadata],
+            "status": "failed" if result.returncode != 0 or result.timed_out else "completed",
+        }
+        errors = validate_document(evidence, "run-evidence", self.resources)
+        if errors:
+            raise ValueError("; ".join(errors))
+        self.store.write_artifact(workspace, f"{base}/evidence.json", self._json_bytes(evidence))
+
+    @staticmethod
+    def _provider_from_route(route: str) -> str:
+        provider = route.rsplit("/", 1)[-1]
+        return provider or route
+
+    @staticmethod
+    def _json_bytes(value: object) -> bytes:
+        return (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
     def _command_result_artifacts(self, results: object, run_id: str) -> dict[str, bytes]:
         if results is None:
