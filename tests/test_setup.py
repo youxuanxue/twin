@@ -120,3 +120,54 @@ class SetupOwnershipTest(TestCase):
         self.assertEqual(set(payload["links"]), {
             "cursor_skill", "claude_skill", "codex_skill", "antigravity_skill",
         })
+
+    def test_setup_check_rejects_legacy_cursor_registry_link(self) -> None:
+        legacy_registry = self._replace_cursor_registry_with_legacy_link()
+
+        output = StringIO()
+        with patch("twin.cli._paths_for_home", return_value=self.paths):
+            with patch("twin.cli._resource_catalog", return_value=self.resources):
+                with redirect_stdout(output):
+                    self.assertEqual(main(["setup", "--check", "--json"]), 0)
+
+        payload = json.loads(output.getvalue())
+        self.assertFalse(payload["ok"])
+        self.assertFalse(payload["links"]["cursor_skill"]["ok"])
+        self.assertIn(
+            "complete the dev-rules additive-registry cutover first",
+            payload["links"]["cursor_skill"]["detail"],
+        )
+        self.assertTrue((self.home / ".cursor" / "skills").is_symlink())
+        self.assertEqual(
+            (self.home / ".cursor" / "skills").resolve(), legacy_registry.resolve()
+        )
+
+    def test_doctor_rejects_legacy_cursor_registry_link(self) -> None:
+        legacy_registry = self._replace_cursor_registry_with_legacy_link()
+
+        output = StringIO()
+        with patch("twin.cli._paths_for_home", return_value=self.paths):
+            with patch("twin.cli._resource_catalog", return_value=self.resources):
+                with patch("twin.doctor.shutil.which", return_value="/usr/bin/git"):
+                    with redirect_stdout(output):
+                        self.assertEqual(main(["doctor", "--json"]), 0)
+
+        payload = json.loads(output.getvalue())
+        self.assertFalse(payload["ok"])
+        self.assertFalse(payload["checks"]["cursor_skill"]["ok"])
+        self.assertIn(
+            "complete the dev-rules additive-registry cutover first",
+            payload["checks"]["cursor_skill"]["detail"],
+        )
+        self.assertTrue((self.home / ".cursor" / "skills").is_symlink())
+        self.assertEqual(
+            (self.home / ".cursor" / "skills").resolve(), legacy_registry.resolve()
+        )
+
+    def _replace_cursor_registry_with_legacy_link(self) -> Path:
+        install_skill(self.paths, self.resources, self.home)
+        cursor_skills = self.home / ".cursor" / "skills"
+        legacy_registry = self.root / "legacy-skills"
+        cursor_skills.rename(legacy_registry)
+        cursor_skills.symlink_to(legacy_registry, target_is_directory=True)
+        return legacy_registry

@@ -60,11 +60,14 @@ def check_skill_links(paths: TwinPaths, home: Path) -> list[LinkResult]:
     home = home.expanduser().resolve()
     installed = paths.installed_skills / "twin"
     installed_ok = installed.is_dir() and not installed.is_symlink()
-    results = [
-        _link_result(name, home / relative, installed, installed_ok)
-        for name, relative in _HOST_SKILLS.items()
-    ]
     cursor_skills = home / _CURSOR_SKILLS
+    cursor_error = _cursor_registry_error(cursor_skills)
+    results = []
+    for name, relative in _HOST_SKILLS.items():
+        if name == "cursor_skill" and cursor_error is not None:
+            results.append(LinkResult(name, False, cursor_error))
+        else:
+            results.append(_link_result(name, home / relative, installed, installed_ok))
     claude_skills = home / _CLAUDE_SKILLS
     if not claude_skills.is_symlink():
         results.append(LinkResult("claude_skill", False, f"missing skill link: {claude_skills}"))
@@ -104,12 +107,17 @@ def _ensure_cursor_registry(cursor_skills: Path) -> None:
 
 
 def _validate_cursor_registry(cursor_skills: Path) -> None:
+    error = _cursor_registry_error(cursor_skills)
+    if error is not None:
+        raise ValueError(error)
+
+
+def _cursor_registry_error(cursor_skills: Path) -> str | None:
     if cursor_skills.is_symlink():
-        raise ValueError(
-            f"{cursor_skills} is a legacy whole-registry symlink; {_CUTOVER_INSTRUCTION}"
-        )
+        return f"{cursor_skills} is a legacy whole-registry symlink; {_CUTOVER_INSTRUCTION}"
     if _exists(cursor_skills) and not cursor_skills.is_dir():
-        raise ValueError(f"{cursor_skills} must be a real directory")
+        return f"{cursor_skills} must be a real directory"
+    return None
 
 
 def _ensure_claude_registry(home: Path, cursor_skills: Path) -> None:
