@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from twin.resources import ResourceCatalog
@@ -46,6 +47,57 @@ def render_contract(
         "commands": exported,
         "action_commands": action_commands,
     }
+
+
+def render_agent_integration(
+    parser: "argparse.ArgumentParser", resources: ResourceCatalog
+) -> str:
+    """Render the checked-in agent guide from the live command contract."""
+    contract = render_contract(parser, resources)
+    commands = contract["commands"]
+    assert isinstance(commands, dict)
+    lines = [
+        "<!-- Generated from `twin contract --json`; do not edit by hand. -->",
+        "",
+        "# Twin agent integration",
+        "",
+        "Agents discover Twin only through `twin contract --json`, then invoke the exact",
+        "console command named there. Submission tokens and schema paths are emitted at runtime",
+        "and must be consumed literally.",
+        "",
+        "## Commands",
+        "",
+    ]
+    for name, raw_command in commands.items():
+        assert isinstance(name, str)
+        assert isinstance(raw_command, dict)
+        argv = raw_command["argv"]
+        output = raw_command["output"]
+        assert isinstance(argv, list)
+        assert isinstance(output, dict)
+        lines.append(f"- `{name}`: `{' '.join(str(part) for part in argv)}`")
+        lines.append(f"  - output: `{output['shape']}`")
+        schema_path = output.get("schema_path")
+        if isinstance(schema_path, str):
+            lines.append(f"  - schema: `{_relative_resource_path(schema_path, resources)}`")
+    action_commands = contract["action_commands"]
+    assert isinstance(action_commands, list)
+    lines.extend([
+        "",
+        "## Action-only submissions",
+        "",
+        "The following commands are intentionally omitted from interactive help and are returned",
+        "only as action handoffs: " + ", ".join(f"`{name}`" for name in action_commands) + ".",
+        "",
+    ])
+    return "\n".join(lines)
+
+
+def _relative_resource_path(path: str, resources: ResourceCatalog) -> str:
+    try:
+        return str(Path(path).relative_to(resources.root))
+    except ValueError:
+        return path
 
 
 def _package_version() -> str:

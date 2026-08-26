@@ -70,7 +70,7 @@ class SetupOwnershipTest(TestCase):
         (cursor / "skills").symlink_to(legacy_registry, target_is_directory=True)
 
         with self.assertRaisesRegex(
-            ValueError, "complete the dev-rules additive-registry cutover first"
+            ValueError, "complete the additive-registry cutover first"
         ):
             install_skill(self.paths, self.resources, self.home)
 
@@ -134,7 +134,7 @@ class SetupOwnershipTest(TestCase):
         self.assertFalse(payload["ok"])
         self.assertFalse(payload["links"]["cursor_skill"]["ok"])
         self.assertIn(
-            "complete the dev-rules additive-registry cutover first",
+            "complete the additive-registry cutover first",
             payload["links"]["cursor_skill"]["detail"],
         )
         self.assertTrue((self.home / ".cursor" / "skills").is_symlink())
@@ -156,7 +156,7 @@ class SetupOwnershipTest(TestCase):
         self.assertFalse(payload["ok"])
         self.assertFalse(payload["checks"]["cursor_skill"]["ok"])
         self.assertIn(
-            "complete the dev-rules additive-registry cutover first",
+            "complete the additive-registry cutover first",
             payload["checks"]["cursor_skill"]["detail"],
         )
         self.assertTrue((self.home / ".cursor" / "skills").is_symlink())

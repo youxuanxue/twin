@@ -239,13 +239,7 @@ def _paths_for_home() -> TwinPaths:
 
 
 def _resource_catalog() -> ResourceCatalog:
-    installed = ResourceCatalog()
-    if installed.root.is_dir():
-        return installed
-    source_root = Path(__file__).resolve().parents[2]
-    if (source_root / "schemas").is_dir():
-        return ResourceCatalog(source_root)
-    return installed
+    return ResourceCatalog()
 
 
 def _add_json_flag(parser: argparse.ArgumentParser, *, required: bool = False) -> None:

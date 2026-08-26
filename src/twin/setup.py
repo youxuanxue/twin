@@ -18,7 +18,7 @@ _HOST_SKILLS = {
 }
 _CLAUDE_SKILLS = Path(".claude/skills")
 _CURSOR_SKILLS = Path(".cursor/skills")
-_CUTOVER_INSTRUCTION = "complete the dev-rules additive-registry cutover first"
+_CUTOVER_INSTRUCTION = "complete the additive-registry cutover first"
 
 
 @dataclass(frozen=True)

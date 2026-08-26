@@ -8,7 +8,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from twin.cli import build_parser, main, parser_help
-from twin.contract import render_contract
+from twin.contract import render_agent_integration, render_contract
 from twin.domain.service import TwinService
 from twin.paths import TwinPaths
 from twin.resources import ResourceCatalog
@@ -67,6 +67,17 @@ class CliSurfaceTest(TestCase):
                 "submit-review": {"shape": "workspace-result"},
             },
         )
+
+    def test_agent_integration_document_is_rendered_from_live_contract(self) -> None:
+        document = render_agent_integration(build_parser(), self.resources)
+
+        self.assertIn("Generated from `twin contract --json`", document)
+        self.assertIn("## Commands", document)
+        self.assertIn("`submit-review`", document)
+        self.assertIn("`schemas/twin.action.schema.json`", document)
+        self.assertNotIn(str(self.resources.root), document)
+        generated = Path(__file__).resolve().parents[1] / "docs" / "agent-integration.md"
+        self.assertEqual(generated.read_text(encoding="utf-8"), document)
 
     def test_mandatory_json_commands_reject_missing_json_flag(self) -> None:
         parser = build_parser()
@@ -131,12 +142,21 @@ class CliSurfaceTest(TestCase):
 
     def test_contract_command_emits_json_without_provider_dependency(self) -> None:
         output = StringIO()
-        with patch("sys.stdout", output):
-            self.assertEqual(main(["contract", "--json"]), 0)
+        with patch("twin.cli._resource_catalog", return_value=self.resources):
+            with patch("sys.stdout", output):
+                self.assertEqual(main(["contract", "--json"]), 0)
         payload = json.loads(output.getvalue())
         self.assertEqual(payload["contract_version"], 1)
         self.assertIn("submit-review", payload["action_commands"])
         self.assertTrue(Path(payload["schema_paths"]["action"]).is_file())
+
+    def test_resource_catalog_never_falls_back_to_a_source_checkout(self) -> None:
+        missing = ResourceCatalog(Path("/missing-installed-resources"))
+        with patch("twin.cli.ResourceCatalog", return_value=missing) as catalog:
+            from twin.cli import _resource_catalog
+
+            self.assertIs(_resource_catalog(), missing)
+        catalog.assert_called_once_with()
 
     def test_start_emits_an_author_plan_action(self) -> None:
         with TemporaryDirectory() as raw:
