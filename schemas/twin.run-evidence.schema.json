@@ -5,6 +5,13 @@
   "type": "object",
   "required": ["schema_version", "run_id", "item_id", "request", "result", "evidence", "status"],
   "properties": {
-    "schema_version": {"const": 1}, "run_id": {"type": "string", "minLength": 1}, "item_id": {"type": "string", "minLength": 1}, "request": {"type": "object", "additionalProperties": false, "properties": {"metadata": {"type": "object", "maxProperties": 16, "additionalProperties": {"type": ["string", "number", "boolean", "null"]}}}}, "result": {"type": "object", "additionalProperties": false, "properties": {"metadata": {"type": "object", "maxProperties": 16, "additionalProperties": {"type": ["string", "number", "boolean", "null"]}}}}, "evidence": {"type": "array", "items": {"type": "object", "additionalProperties": false, "properties": {"relative": {"type": "string"}, "sha256": {"type": "string"}, "bytes": {"type": "integer", "minimum": 0}, "metadata": {"type": "object", "maxProperties": 16, "additionalProperties": {"type": ["string", "number", "boolean", "null"]}}}}}, "status": {"type": "string", "minLength": 1}, "metadata": {"type": "object", "maxProperties": 16, "additionalProperties": {"type": ["string", "number", "boolean", "null"]}}
-  }, "additionalProperties": false
+    "schema_version": {"const": 1},
+    "run_id": {"type": "string", "minLength": 1},
+    "item_id": {"type": "string", "minLength": 1},
+    "request": {"type": "object", "required": ["relative", "sha256", "bytes"], "additionalProperties": false, "properties": {"relative": {"type": "string", "minLength": 1}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "bytes": {"type": "integer", "minimum": 0}}},
+    "result": {"type": "object", "required": ["relative", "sha256", "bytes"], "additionalProperties": false, "properties": {"relative": {"type": "string", "minLength": 1}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "bytes": {"type": "integer", "minimum": 0}}},
+    "evidence": {"type": "array", "items": {"type": "object", "required": ["relative", "sha256", "bytes"], "additionalProperties": false, "properties": {"relative": {"type": "string", "minLength": 1}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "bytes": {"type": "integer", "minimum": 0}}}},
+    "status": {"type": "string", "enum": ["completed", "failed"]}
+  },
+  "additionalProperties": false
 }

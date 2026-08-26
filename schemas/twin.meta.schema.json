@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/youxuanxue/twin/schemas/twin.meta.schema.json",
+  "title": "Twin workspace metadata",
+  "type": "object",
+  "required": ["schema_version", "workspace_id", "created_at", "repo_root", "repository_identity"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "workspace_id": {"type": "string", "minLength": 1},
+    "created_at": {"type": "string", "minLength": 1},
+    "repo_root": {"type": "string", "minLength": 1},
+    "repository_identity": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "additionalProperties": false
+}

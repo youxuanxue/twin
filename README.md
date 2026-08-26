@@ -18,3 +18,5 @@ TWIN_REQUIRE_CONTAINER=1 bash scripts/preflight.sh
 
 See `docs/operator-guide.md` for setup and recovery, `docs/architecture.md` for
 the data boundary, and `docs/agent-integration.md` for the generated agent contract.
+Worker execution is selected explicitly in `~/.twin/config.toml`; supervisor routes do
+not select providers.

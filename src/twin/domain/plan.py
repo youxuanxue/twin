@@ -1,10 +1,125 @@
 from __future__ import annotations
 
+import copy
 from collections import defaultdict
+from pathlib import PurePosixPath
 from typing import Callable
 
 
 ITEM_STATUSES = frozenset({"pending", "in_progress", "completed", "blocked", "deferred"})
+_REQUIRED_ITEM_FIELDS = (
+    "id", "deliverable", "scope", "covers_ac", "evidence_plan", "actual_evidence",
+    "depends_on", "status", "next_action",
+)
+
+
+def materialize_run_evidence(
+    plan: dict[str, object], item_id: str, run_id: str
+) -> dict[str, object]:
+    """Bind the current item's evidence templates to one immutable worker run."""
+    materialized = copy.deepcopy(plan)
+    items = materialized.get("items")
+    if not isinstance(items, list):
+        return materialized
+    for item in items:
+        if not isinstance(item, dict) or item.get("id") != item_id:
+            continue
+        evidence = item.get("evidence_plan")
+        if isinstance(evidence, list):
+            item["evidence_plan"] = [
+                value.replace("{run_id}", run_id) if isinstance(value, str) else value
+                for value in evidence
+            ]
+        break
+    return materialized
+
+
+def validate_ready_plan(goal: dict[str, object], plan: dict[str, object]) -> list[str]:
+    """Validate the stricter semantic boundary between editable drafts and runnable work."""
+    errors: list[str] = []
+    criteria = goal.get("acceptance_criteria")
+    criterion_ids: set[str] = set()
+    if not isinstance(criteria, list) or not criteria:
+        errors.append("goal requires at least one acceptance criterion")
+    else:
+        for index, criterion in enumerate(criteria):
+            if not isinstance(criterion, dict):
+                errors.append(f"acceptance_criteria[{index}] must be object")
+                continue
+            criterion_id = criterion.get("id")
+            statement = criterion.get("statement")
+            evidence_type = criterion.get("evidence_type")
+            if not isinstance(criterion_id, str) or not criterion_id.strip():
+                errors.append(f"acceptance_criteria[{index}].id is required")
+                continue
+            if criterion_id in criterion_ids:
+                errors.append(f"duplicate acceptance criterion id: {criterion_id}")
+            criterion_ids.add(criterion_id)
+            if not isinstance(statement, str) or not statement.strip():
+                errors.append(f"{criterion_id}: statement is required")
+            if not isinstance(evidence_type, str) or not evidence_type.strip():
+                errors.append(f"{criterion_id}: evidence_type is required")
+
+    verification = plan.get("verification")
+    if (
+        not isinstance(verification, list)
+        or not verification
+        or not all(isinstance(command, str) and command.strip() for command in verification)
+    ):
+        errors.append("verification must contain at least one command")
+
+    items = plan.get("items")
+    if not isinstance(items, list) or not items:
+        errors.append("plan requires at least one actionable item")
+        return errors + validate_plan(goal, plan)
+
+    item_ids: set[str] = set()
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            errors.append(f"items[{index}] must be object")
+            continue
+        for field in _REQUIRED_ITEM_FIELDS:
+            if field not in item:
+                errors.append(f"items[{index}].{field} is required")
+        item_id = item.get("id")
+        if not isinstance(item_id, str) or not item_id.strip():
+            continue
+        if item_id in item_ids:
+            errors.append(f"duplicate plan item id: {item_id}")
+        item_ids.add(item_id)
+        for field in ("deliverable", "scope", "next_action"):
+            value = item.get(field)
+            if not isinstance(value, str) or not value.strip():
+                errors.append(f"{item_id}: {field} is required")
+        for field in ("covers_ac", "evidence_plan", "actual_evidence", "depends_on"):
+            values = item.get(field)
+            if not isinstance(values, list) or not all(
+                isinstance(value, str) and value for value in values
+            ):
+                errors.append(f"{item_id}: {field} must be a list of non-empty strings")
+        covers = item.get("covers_ac")
+        evidence_plan = item.get("evidence_plan")
+        if isinstance(covers, list) and covers and (
+            not isinstance(evidence_plan, list) or not evidence_plan
+        ):
+            errors.append(f"{item_id}: evidence_plan is required for acceptance coverage")
+        if isinstance(evidence_plan, list):
+            for entry in evidence_plan:
+                if isinstance(entry, str) and not _valid_evidence_entry(entry):
+                    errors.append(f"{item_id}: invalid evidence declaration {entry}")
+    errors.extend(validate_plan(goal, plan))
+    return list(dict.fromkeys(errors))
+
+
+def _valid_evidence_entry(entry: str) -> bool:
+    relative = entry.removeprefix("command:") if entry.startswith("command:") else entry
+    path = PurePosixPath(relative)
+    return (
+        bool(relative)
+        and not path.is_absolute()
+        and path.parts[:1] == ("artifacts",)
+        and all(part not in {"", ".", ".."} for part in path.parts)
+    )
 
 
 def validate_plan(goal: dict[str, object], plan: dict[str, object]) -> list[str]:

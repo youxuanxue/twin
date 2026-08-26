@@ -9,6 +9,7 @@ from pathlib import Path
 
 from twin.paths import TwinPaths
 from twin.resources import ResourceCatalog
+from twin.skill_manifest import expected_skill_manifest, installed_skill_drift
 
 
 _HOST_SKILLS = {
@@ -36,6 +37,8 @@ def install_skill(
 ) -> list[LinkResult]:
     """Copy Twin's packaged skill and link each supported host directly to it."""
     home = home.expanduser().resolve()
+    packaged_skill = resources.skill_dir()
+    expected_skill_manifest(packaged_skill)
     cursor_skills = home / _CURSOR_SKILLS
     _validate_cursor_registry(cursor_skills)
     _validate_claude_registry(home, cursor_skills)
@@ -46,23 +49,37 @@ def install_skill(
     _ensure_cursor_registry(cursor_skills)
     _ensure_claude_registry(home, cursor_skills)
     installed = paths.installed_skills / "twin"
-    _copy_skill_atomically(resources.skill_dir(), installed)
+    _copy_skill_atomically(packaged_skill, installed)
     for target in targets.values():
         target.parent.mkdir(parents=True, exist_ok=True)
         if _exists(target):
             target.unlink()
         target.symlink_to(installed, target_is_directory=True)
-    return check_skill_links(paths, home)
+    return check_skill_links(paths, home, resources=resources)
 
 
-def check_skill_links(paths: TwinPaths, home: Path) -> list[LinkResult]:
+def check_skill_links(
+    paths: TwinPaths, home: Path, *, resources: ResourceCatalog
+) -> list[LinkResult]:
     """Report whether host entries point directly at Twin's installed skill copy."""
     home = home.expanduser().resolve()
     installed = paths.installed_skills / "twin"
     installed_ok = installed.is_dir() and not installed.is_symlink()
+    try:
+        packaged_skill = resources.skill_dir()
+    except FileNotFoundError as exc:
+        drift = f"packaged Twin skill manifest drift: {exc}"
+    else:
+        drift = installed_skill_drift(packaged_skill, installed)
     cursor_skills = home / _CURSOR_SKILLS
     cursor_error = _cursor_registry_error(cursor_skills)
-    results = []
+    results = [
+        LinkResult(
+            "installed_skill",
+            drift is None,
+            str(installed) if drift is None else drift,
+        )
+    ]
     for name, relative in _HOST_SKILLS.items():
         if name == "cursor_skill" and cursor_error is not None:
             results.append(LinkResult(name, False, cursor_error))

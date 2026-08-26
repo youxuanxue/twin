@@ -5,7 +5,11 @@ import json
 import socket
 from urllib import error, parse, request as urllib_request
 
-from twin.runtime.protocols import WorkerTurnRequest, WorkerTurnResult
+from twin.runtime.protocols import (
+    WorkerTurnRequest,
+    WorkerTurnResult,
+    parse_worker_submission,
+)
 
 
 class _NoRedirect(urllib_request.HTTPRedirectHandler):
@@ -14,6 +18,8 @@ class _NoRedirect(urllib_request.HTTPRedirectHandler):
 
 
 class CaoRuntime:
+    contract_version = 1
+
     def __init__(
         self,
         endpoint: str,
@@ -41,6 +47,7 @@ class CaoRuntime:
             "prompt": request.prompt,
             "session_id": request.session_id,
             "cwd": str(request.cwd),
+            "teardown": True,
         }).encode("utf-8")
         outbound = urllib_request.Request(
             self.endpoint,
@@ -78,6 +85,7 @@ class CaoRuntime:
         if (
             not isinstance(output, str)
             or not isinstance(returncode, int)
+            or isinstance(returncode, bool)
             or not isinstance(session_id, str)
             or not isinstance(events, list)
             or not all(isinstance(event, dict) for event in events)
@@ -88,6 +96,7 @@ class CaoRuntime:
             returncode=returncode,
             session_id=session_id,
             events=tuple(events),
+            submission=parse_worker_submission(output),
         )
 
     def _guard_endpoint(self) -> str | None:

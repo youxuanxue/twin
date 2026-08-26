@@ -11,6 +11,7 @@ _SAFE_DETAIL_KEYS = {
     "action", "artifact", "artifacts", "bytes", "count", "exit_code", "from_route",
     "item_id", "kind", "length", "relative", "route", "run_id", "sha256", "size",
     "state_revision", "status", "timed_out", "to_route", "workspace_id",
+    "repository_identity", "provider", "adapter",
 }
 _SAFE_TEXT = re.compile(r"^[A-Za-z0-9._:/-]{1,256}$")
 

@@ -1,6 +1,14 @@
 # worker execution preferences
 
-你是被 xuejiao twin supervisor 指挥的 Claude Code worker。你的目标是尽可能完整达成当前 `goal.yaml` 和 `plan`，不是只完成一个机械小步骤。
+你是被 xuejiao Twin supervisor 指挥的 provider-neutral worker。你的目标是尽可能完整达成当前 `goal.yaml` 和 `plan.yaml`，不是只完成一个机械小步骤。
+
+## Runtime contract
+
+- `Twin run context` 是本轮唯一的 workspace、run、item 和 repository 身份来源。
+- `plan.yaml` 中的 `{run_id}` 已由 runtime 物化；命令证据必须复用其中的完整 `command:artifacts/runs/<run_id>/...` 路径。
+- 最终 stdout 只能是一个符合 `Twin worker submission contract` 的 JSON object，不要 Markdown、前后说明或代码围栏。
+- `updates` 写权威 plan 变化；`command_results` 写命令退出码与输出；`artifacts` 只写受控的 `artifacts/...` 文本材料。
+- runtime 原子提交 plan、artifacts、result、evidence 与 review state；不要调用 Twin submission 命令或直接写 `~/.twin`。
 
 ## Work style
 
@@ -53,20 +61,16 @@
 - 新增普通代码依赖或 dev/test 依赖，只要理由清晰、锁文件同步、验证通过，且不改变安全/架构/基础设施边界。
 - 低风险文档、测试、脚本、局部实现调整。
 
-## Reporting format
+## Submission shape
 
-返回给 supervisor 时保持短而完整：
+返回一个 JSON object，字段固定为：
 
-```text
-Summary:
-- <完成了什么>
-
-Evidence:
-- diff: <摘要>
-- tests: <命令与结果>
-- preflight: <命令与结果；未触发门禁时写 not required>
-- PR/commit: <状态，如适用>
-
-Remaining:
-- <未完成或 blocker；没有就写 none>
+```json
+{
+  "updates": [],
+  "command_results": [],
+  "artifacts": []
+}
 ```
+
+把 summary、diff、测试、preflight、PR/commit 与 blocker 证据放入上述三个结构化字段；没有内容的数组仍必须保留。

@@ -1,0 +1,5 @@
+2.1.246 (Claude Code)
+-p, --print                           Print response and exit
+--output-format <format>              text, json, or stream-json
+--allowedTools, --allowed-tools <tools...>
+--max-budget-usd <amount>

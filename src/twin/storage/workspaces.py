@@ -12,8 +12,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from twin.domain.integrity import WorkspaceSnapshot, validate_workspace_integrity
 from twin.paths import TwinPaths
-from twin.storage.atomic import write_bytes, write_text
+from twin.resources import ResourceCatalog
+from twin.storage.atomic import write_text
 from twin.storage.events import append_jsonl, event_record, now_utc
 from twin.storage.locks import exclusive_lock
 from twin.yaml_codec import dump_yaml
@@ -37,14 +39,24 @@ class _StagedFile:
 
 
 class WorkspaceStore:
-    def __init__(self, paths: TwinPaths) -> None:
+    def __init__(self, paths: TwinPaths, resources: ResourceCatalog | None = None) -> None:
         self.paths = paths
+        self.integrity_resources = resources
+
+    def bind_integrity(self, resources: ResourceCatalog) -> None:
+        if (
+            self.integrity_resources is not None
+            and self.integrity_resources.root.resolve() != resources.root.resolve()
+        ):
+            raise ValueError("workspace store resource catalog mismatch")
+        self.integrity_resources = resources
 
     def create(self, request: str, repo_root: Path, route: str) -> str:
         canonical_repo = repo_root.expanduser().resolve()
         if not canonical_repo.is_dir():
             raise ValueError(f"target repository does not exist: {canonical_repo}")
         workspace_id = self._new_workspace_id(request)
+        repository_identity = self._project_key(canonical_repo)
         workspace = self.paths.workspaces / workspace_id
         workspace.mkdir(parents=True, exist_ok=False)
         (workspace / "artifacts").mkdir()
@@ -54,6 +66,7 @@ class WorkspaceStore:
             "status": "awaiting_plan",
             "state_revision": 0,
             "supervisor_route": route,
+            "repository_identity": repository_identity,
             "pending_action": None,
             "current_run_id": None,
             "current_item_id": None,
@@ -64,6 +77,7 @@ class WorkspaceStore:
             "workspace_id": workspace_id,
             "created_at": now_utc(),
             "repo_root": str(canonical_repo),
+            "repository_identity": repository_identity,
         })
         goal_text = request.strip() or "Untitled goal"
         dump_yaml(workspace / "goal.yaml", {
@@ -83,7 +97,17 @@ class WorkspaceStore:
         self._write_json(workspace / "state.json", state)
         pointer = self.paths.active_workspaces / self._project_key(canonical_repo)
         write_text(pointer, workspace_id + "\n")
-        self.append_event(workspace, {"event": "workspace_created", "details": {}})
+        append_jsonl(
+            workspace / "events.jsonl",
+            event_record(
+                workspace_id=workspace_id,
+                state_revision=0,
+                event={
+                    "event": "workspace_created",
+                    "details": {"repository_identity": repository_identity},
+                },
+            ),
+        )
         return workspace_id
 
     def resolve(self, ref: str | None, project_root: Path) -> Path:
@@ -104,16 +128,48 @@ class WorkspaceStore:
         self._require_workspace_path(workspace)
         if not workspace.is_dir():
             raise ValueError(f"workspace does not exist: {workspace}")
+        canonical_project = project_root.expanduser().resolve()
+        with self._lock(workspace):
+            self._recover_locked(workspace)
+            snapshot = self._integrity_snapshot_locked(workspace)
+            meta = snapshot.meta if snapshot is not None else self._read_json(workspace / "meta.json")
+            recorded = meta.get("repo_root") if isinstance(meta, dict) else None
+            if recorded != str(canonical_project):
+                raise ValueError("workspace repository mismatch")
+        return self._display_path(workspace)
+
+    def resolve_submission(self, ref: str) -> Path:
+        candidate = Path(ref).expanduser()
+        if candidate.name != ref or not ref:
+            raise ValueError("workspace reference must be an ID")
+        workspace = (self.paths.workspaces / ref).resolve()
+        self._require_workspace_path(workspace)
+        if not workspace.is_dir():
+            raise ValueError(f"workspace does not exist: {workspace}")
+        with self._lock(workspace):
+            self._recover_locked(workspace)
+            self._integrity_snapshot_locked(workspace)
         return self._display_path(workspace)
 
     def load_state(self, workspace: Path) -> dict[str, object]:
         workspace = self._workspace_path(workspace)
         with self._lock(workspace):
             self._recover_locked(workspace)
-            value = self._load_state_unlocked(workspace)
+            snapshot = self._integrity_snapshot_locked(workspace)
+            value = snapshot.state if snapshot is not None else self._load_state_unlocked(workspace)
         if not isinstance(value, dict):
             raise ValueError("state must be an object")
         return value
+
+    def inspect(self, workspace: Path, resources: ResourceCatalog) -> WorkspaceSnapshot:
+        workspace = self._workspace_path(workspace)
+        with self._lock(workspace):
+            self._recover_locked(workspace)
+            return validate_workspace_integrity(workspace, resources)
+
+    def worker_runtime_lock(self, workspace: Path):
+        workspace = self._workspace_path(workspace)
+        return exclusive_lock(self.paths.locks / f"{workspace.name}.worker-runtime.lock")
 
     def replace_state(
         self, workspace: Path, expected_revision: int, value: dict[str, object]
@@ -128,22 +184,33 @@ class WorkspaceStore:
         workspace = self._workspace_path(workspace)
         with self._lock(workspace):
             self._recover_locked(workspace)
+            self._integrity_snapshot_locked(workspace)
             self._append_event_locked(workspace, event)
 
     def write_artifact(
         self, workspace: Path, relative: str, body: bytes
     ) -> dict[str, object]:
         workspace = self._workspace_path(workspace)
-        with self._lock(workspace):
-            self._recover_locked(workspace)
-            target = self._artifact_path(workspace, relative)
-            write_bytes(target, body)
-            metadata: dict[str, object] = {
-                "relative": str(target.relative_to(workspace)),
-                "sha256": hashlib.sha256(body).hexdigest(),
-                "bytes": len(body),
-            }
-            self._append_event_locked(workspace, {"event": "artifact_written", "details": metadata})
+        target = self._artifact_path(workspace, relative)
+        canonical_relative = str(target.relative_to(workspace))
+        metadata: dict[str, object] = {
+            "relative": canonical_relative,
+            "sha256": hashlib.sha256(body).hexdigest(),
+            "bytes": len(body),
+        }
+        state = self.load_state(workspace)
+        revision = state.get("state_revision")
+        if not isinstance(revision, int):
+            raise ValueError("invalid state revision")
+        self.commit_action(
+            workspace,
+            revision,
+            state,
+            documents={},
+            artifacts={canonical_relative: body},
+            event=None,
+            validate_current=lambda current: None,
+        )
         return metadata
 
     def commit_action(
@@ -163,6 +230,7 @@ class WorkspaceStore:
             workspace_fd = self._open_workspace_directory(workspace)
             try:
                 self._recover_locked(workspace, workspace_fd)
+                self._integrity_snapshot_locked(workspace)
                 self._commit_action_locked(
                     workspace,
                     workspace_fd,
@@ -209,6 +277,14 @@ class WorkspaceStore:
         artifact_metadata: list[dict[str, object]] = []
         for relative, body in artifacts.items():
             target = self._artifact_path(workspace, relative)
+            if target in targets:
+                raise ValueError(
+                    f"duplicate artifact path: {target.relative_to(workspace)}"
+                )
+            if self._read_target_bytes(
+                workspace_fd, str(target.relative_to(workspace))
+            ) is not None:
+                raise ValueError(f"artifact already exists: {relative}")
             targets[target] = body
             artifact_metadata.append({
                 "relative": str(target.relative_to(workspace)),
@@ -303,6 +379,13 @@ class WorkspaceStore:
         if not isinstance(value, dict):
             raise ValueError("state must be an object")
         return value
+
+    def _integrity_snapshot_locked(
+        self, workspace: Path
+    ) -> WorkspaceSnapshot | None:
+        if self.integrity_resources is None:
+            return None
+        return validate_workspace_integrity(workspace, self.integrity_resources)
 
     def _append_event_locked(self, workspace: Path, event: dict[str, object]) -> None:
         state = self._load_state_unlocked(workspace)
@@ -751,6 +834,8 @@ class WorkspaceStore:
             "meta.json", "goal.yaml", "plan.yaml", "state.json", "events.jsonl"
         }:
             raise ValueError("artifact path is reserved")
+        if rendered.parts[:1] not in {("artifacts",), ("runs",)}:
+            raise ValueError("artifact path must start with artifacts/ or runs/")
         return target
 
     @staticmethod

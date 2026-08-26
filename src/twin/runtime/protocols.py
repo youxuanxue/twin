@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Protocol
@@ -44,6 +45,14 @@ def worker_process_environment(
     return inherited
 
 
+def parse_worker_submission(output_text: str) -> dict[str, object] | None:
+    try:
+        value = json.loads(output_text)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
 @dataclass(frozen=True)
 class WorkerTurnRequest:
     prompt: str
@@ -65,9 +74,15 @@ class WorkerTurnResult:
     session_id: str
     events: tuple[dict[str, object], ...]
     timed_out: bool = False
+    submission: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "events", tuple(dict(event) for event in self.events))
+        object.__setattr__(
+            self,
+            "submission",
+            None if self.submission is None else dict(self.submission),
+        )
 
 
 class WorkerRuntime(Protocol):

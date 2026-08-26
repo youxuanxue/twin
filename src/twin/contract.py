@@ -5,14 +5,14 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from twin.resources import ResourceCatalog
+from twin.resources import SCHEMA_NAMES, ResourceCatalog
 
 if TYPE_CHECKING:
     import argparse
 
 
 CONTRACT_VERSION = 1
-_FALLBACK_PACKAGE_VERSION = "0.1.0"
+_DEVELOPMENT_PACKAGE_VERSION = "0+development"
 
 
 def render_contract(
@@ -42,7 +42,7 @@ def render_contract(
         "package_version": _package_version(),
         "schema_paths": {
             name: str(resources.root / "schemas" / f"twin.{name}.schema.json")
-            for name in ("action", "goal", "plan", "run-evidence", "state")
+            for name in SCHEMA_NAMES
         },
         "commands": exported,
         "action_commands": action_commands,
@@ -77,12 +77,21 @@ def render_agent_integration(
         assert isinstance(output, dict)
         lines.append(f"- `{name}`: `{' '.join(str(part) for part in argv)}`")
         lines.append(f"  - output: `{output['shape']}`")
+        continuation_field = output.get("continuation_field")
+        if isinstance(continuation_field, str):
+            lines.append(f"  - continuation: `{continuation_field}`")
         schema_path = output.get("schema_path")
         if isinstance(schema_path, str):
             lines.append(f"  - schema: `{_relative_resource_path(schema_path, resources)}`")
     action_commands = contract["action_commands"]
     assert isinstance(action_commands, list)
     lines.extend([
+        "",
+        "## Lifecycle continuation",
+        "",
+        "Complete each action through its returned `submit.argv`. After submission, continue from the returned workspace result:",
+        "execute `next_command.argv` exactly when it is non-null, and repeat with each returned result until it is null.",
+        "Do not derive continuation commands from status names.",
         "",
         "## Action-only submissions",
         "",
@@ -104,4 +113,4 @@ def _package_version() -> str:
     try:
         return version("xuejiao-twin")
     except PackageNotFoundError:
-        return _FALLBACK_PACKAGE_VERSION
+        return _DEVELOPMENT_PACKAGE_VERSION

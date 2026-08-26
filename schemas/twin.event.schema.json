@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/youxuanxue/twin/schemas/twin.event.schema.json",
+  "title": "Twin event",
+  "type": "object",
+  "required": ["schema_version", "recorded_at", "event", "workspace_id", "state_revision", "details"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "recorded_at": {"type": "string", "minLength": 1},
+    "event": {"type": "string", "minLength": 1},
+    "workspace_id": {"type": "string", "minLength": 1},
+    "state_revision": {"type": "integer", "minimum": 0},
+    "details": {"type": "object"}
+  },
+  "additionalProperties": false
+}

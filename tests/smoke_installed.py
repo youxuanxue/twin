@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -22,87 +23,143 @@ def main() -> int:
         repo.mkdir()
         env = dict(os.environ)
         env["HOME"] = str(home)
+        env["PATH"] = str(twin.parent) + os.pathsep + env.get("PATH", "")
         _install_fake_git(root, env)
         _install_fake_codex(root)
 
         _json_command(twin, env, "setup", "--json")
+        config = home / ".twin" / "config.toml"
+        config.write_text(
+            '[runtime]\nadapter = "local_cli"\nworker_provider = "codex"\n'
+            'timeout_seconds = 30\n',
+            encoding="utf-8",
+        )
         contract = _json_command(twin, env, "contract", "--json")
-        _require("submit-plan" in contract["action_commands"], "contract omitted submit-plan")
+        _require(
+            contract["action_commands"] == ["submit-plan", "submit-review"],
+            "contract action commands are stale",
+        )
         doctor = _json_command(twin, env, "doctor", "--json")
-        _require(doctor["checks"]["package_resources"]["ok"], "installed resources are unhealthy")
+        _require(doctor["ok"], "installed Twin health gate failed")
+        _require(
+            doctor["checks"]["runtime_configuration"]["ok"],
+            "runtime configuration is unhealthy",
+        )
 
         started = _json_command(
-            twin, env, "start", "ship the smoke lifecycle", "--supervisor", "host/codex", "--json",
+            twin,
+            env,
+            "start",
+            "ship the smoke lifecycle",
+            "--supervisor",
+            "host/antigravity",
+            "--json",
             cwd=repo,
         )
         workspace = _string(started, "workspace")
-        _json_command(
-            twin, env,
-            "submit-plan", "--workspace", workspace, "--supervisor", "host/codex",
-            "--state-revision", str(started["state_revision"]),
-            _action_token_option(_string(started, "action_token")), "--payload-file", "-", "--json",
-            cwd=repo, input_text=json.dumps(_plan_payload()),
+        _require(
+            _object(_object(started, "expected_output"), "payload")["required"]
+            == ["goal", "plan"],
+            "author action omitted its payload contract",
         )
-        reviewed = _json_command(
-            twin, env, "run", workspace, "--supervisor", "host/codex", "--json", cwd=repo,
+        planned = _json_action_submission(
+            env, started, _plan_payload(), cwd=repo
         )
-        _require(reviewed["action"] == "review", "run did not issue a review action")
-        run_id = _string(_object(_object(reviewed, "context"), "metadata"), "run_id")
+        _require(planned["status"] == "ready", "plan submission did not become ready")
+        replay = _command_argv(
+            env,
+            _action_argv(started, "submit"),
+            cwd=repo,
+            input_text=json.dumps(_plan_payload()),
+        )
+        _require(replay.returncode != 0, "replayed action token was accepted")
+        _require(
+            "stale or consumed action" in replay.stderr,
+            f"token replay was rejected for the wrong reason: {replay.stderr!r}",
+        )
 
-        run_root = home / ".twin" / "workspaces" / workspace / "runs" / run_id
+        run_argv = _action_argv(planned, "next_command")
+        crashed = _command_argv(env, run_argv, cwd=repo)
+        workspace_root = home / ".twin" / "workspaces" / workspace
+        failure_detail = ""
+        if crashed.returncode == 0:
+            failed_state = _json_file(workspace_root / "state.json")
+            failed_run_id = failed_state.get("current_run_id")
+            if isinstance(failed_run_id, str):
+                failed_result = workspace_root / "runs" / failed_run_id / "result.json"
+                if failed_result.is_file():
+                    failure_detail = f" result={failed_result.read_text(encoding='utf-8')!r}"
+        _require(
+            crashed.returncode != 0,
+            "first worker run did not kill the Twin process: "
+            f"stdout={crashed.stdout!r} stderr={crashed.stderr!r}{failure_detail}",
+        )
+
+        stranded = _json_file(workspace_root / "state.json")
+        _require(stranded["status"] == "worker_running", "crash did not leave resumable state")
+        run_id = _string(stranded, "current_run_id")
+        run_root = workspace_root / "runs" / run_id
+        request_path = run_root / "request.json"
+        request_text = request_path.read_text(encoding="utf-8")
+        request_payload = json.loads(request_text)
+        _require((run_root / "result.json").exists() is False, "crashed run published a result")
+        _require((run_root / "evidence.json").exists() is False, "crashed run published evidence")
+        _require(request_payload["run_id"] == run_id, "run request identity changed")
+        _require(
+            f"command:artifacts/runs/{run_id}/tests.json" in request_payload["prompt"],
+            "run-bound command evidence was not materialized in the prompt",
+        )
+        _require("action_token" not in request_text, "run request retained an action token field")
+        _require(
+            _string(started, "action_token") not in request_text,
+            "run request retained the author token",
+        )
+
+        reviewed = _json_argv(env, run_argv, cwd=repo)
+        _require(reviewed["action"] == "review", "recovered run did not issue review")
+        _require(reviewed["next_command"] is None, "review action invented a continuation")
+        run_context = _object(_object(reviewed, "context"), "run")
+        _require(run_context["run_id"] == run_id, "recovery created a different run")
+        _require(run_context["status"] == "completed", "worker submission was not completed")
+
         result_payload = _json_file(run_root / "result.json")
-        _require(result_payload["returncode"] == 0, "worker runtime did not succeed")
-        _require(result_payload["output_text"] == "smoke codex completed", "worker output was unexpected")
         evidence_payload = _json_file(run_root / "evidence.json")
+        _require(result_payload["returncode"] == 0, "worker runtime did not succeed")
         _require(evidence_payload["status"] == "completed", "worker evidence was not completed")
+        plan_text = (workspace_root / "plan.yaml").read_text(encoding="utf-8")
+        expected_evidence = f"command:artifacts/runs/{run_id}/tests.json"
+        _require(expected_evidence in plan_text, "plan did not persist run-bound evidence")
 
         worktree = repo.parent / f"{repo.name}-twin-{workspace}"
         _require(worktree.is_dir(), "dirty worker worktree did not survive Twin run")
         _require((worktree / "dirty-preserve.txt").is_file(), "dirty worker file was not preserved")
-        invocation = _json_file(root / "bin" / "codex-invocation.json")
+        first_invocation = _json_file(root / "bin" / "codex-invocation-1.json")
+        second_invocation = _json_file(root / "bin" / "codex-invocation-2.json")
+        for invocation in (first_invocation, second_invocation):
+            _require(
+                invocation["argv"] == ["exec", "--json", "-"],
+                "Codex did not receive the exact exec --json - argv",
+            )
+            _require(invocation["cwd"] == str(worktree), "Codex did not run in the worktree")
+            _require(
+                _string(started, "action_token") not in invocation["stdin"],
+                "worker prompt retained the author token",
+            )
         _require(
-            invocation["argv"][:2] == ["exec", "--json"],
-            "codex did not receive the expected protocol",
+            first_invocation["stdin"] == second_invocation["stdin"],
+            "recovery did not replay the same persisted request",
         )
-        _require(
-            len(invocation["argv"]) == 3 and "## Twin action" in invocation["argv"][2],
-            "codex did not receive the worker prompt",
-        )
-        _require(invocation["cwd"] == str(worktree), "codex did not run in the isolated worktree")
 
-        needs_human = _json_command(
-            twin, env,
-            "submit-review", "--workspace", workspace, "--supervisor", "host/codex",
-            "--state-revision", str(reviewed["state_revision"]),
-            _action_token_option(_string(reviewed, "action_token")), "--run-id", run_id,
-            "--payload-file", "-", "--json", cwd=repo,
-            input_text=json.dumps({"decision": "needs_human"}),
+        accepted = _json_action_submission(
+            env, reviewed, {"decision": "accepted"}, cwd=repo
         )
-        _require(needs_human["status"] == "needs_human", "review did not request a human")
-        resumed = _json_command(
-            twin, env, "respond", "continue", "--workspace", workspace, "--json", cwd=repo,
-        )
-        _require(resumed["status"] == "ready", "human response did not resume work")
-        handed_off = _json_command(
-            twin, env,
-            "handoff", workspace, "--from", "host/codex", "--to", "host/claude", "--json",
-            cwd=repo,
-        )
-        _require(handed_off["supervisor_route"] == "host/claude", "handoff did not persist")
+        _require(accepted["status"] == "accepted_done", "review did not accept completion")
+        _require(accepted["next_command"] is None, "terminal result did not stop the command chain")
 
-        restarted = _json_command(twin, env, "status", workspace, "--json", cwd=repo)
-        _require(restarted["status"] == "ready", "restart recovery did not preserve state")
-        _require(restarted["supervisor_route"] == "host/claude", "restart recovery lost handoff")
-
-        replay = _command(
-            twin, env,
-            "submit-plan", "--workspace", workspace, "--supervisor", "host/codex",
-            "--state-revision", str(started["state_revision"]),
-            _action_token_option(_string(started, "action_token")), "--payload-file", "-", "--json",
-            cwd=repo, input_text=json.dumps(_plan_payload()),
-        )
-        _require(replay.returncode != 0, "replayed action token was accepted")
-        _require("stale or consumed action" in replay.stderr, "token replay was rejected for the wrong reason")
+        for path in (request_path, run_root / "result.json", run_root / "evidence.json"):
+            text = path.read_text(encoding="utf-8")
+            for token in (_string(started, "action_token"), _string(reviewed, "action_token")):
+                _require(token not in text, f"run artifact retained an action token: {path.name}")
 
         setup_check = _json_command(twin, env, "setup", "--check", "--json")
         _require(setup_check["ok"], "setup check failed after lifecycle")
@@ -117,7 +174,7 @@ def _plan_payload() -> dict[str, object]:
             "one_liner": "Ship the smoke lifecycle",
             "core_goal": "Verify the installed Twin lifecycle",
             "acceptance_criteria": [
-                {"id": "ac-1", "statement": "Lifecycle completes", "evidence_type": "artifact"},
+                {"id": "ac-1", "statement": "Lifecycle completes", "evidence_type": "command"},
             ],
             "non_goals": [],
         },
@@ -130,7 +187,7 @@ def _plan_payload() -> dict[str, object]:
                     "deliverable": "Installed lifecycle proof",
                     "scope": "Smoke fixture only",
                     "covers_ac": ["ac-1"],
-                    "evidence_plan": ["artifacts/evidence.txt"],
+                    "evidence_plan": ["command:artifacts/runs/{run_id}/tests.json"],
                     "actual_evidence": [],
                     "depends_on": [],
                     "status": "pending",
@@ -210,47 +267,158 @@ def _install_fake_codex(root: Path) -> None:
     codex.write_text(
         """#!/opt/twin-venv/bin/python
 import json
+import os
+import re
+import signal
 import sys
 from pathlib import Path
 
 
 args = sys.argv[1:]
-record = Path(__file__).with_name("codex-invocation.json")
-record.write_text(json.dumps({"argv": args, "cwd": str(Path.cwd())}), encoding="utf-8")
-if args[:2] != ["exec", "--json"] or len(args) != 3:
+prompt = sys.stdin.read()
+counter_path = Path(__file__).with_name("codex-counter.txt")
+count = int(counter_path.read_text(encoding="utf-8")) + 1 if counter_path.is_file() else 1
+counter_path.write_text(str(count), encoding="utf-8")
+record = Path(__file__).with_name(f"codex-invocation-{count}.json")
+record.write_text(
+    json.dumps({"argv": args, "cwd": str(Path.cwd()), "stdin": prompt}),
+    encoding="utf-8",
+)
+if args != ["exec", "--json", "-"]:
     raise SystemExit(2)
-print(json.dumps({"session_id": "smoke-codex-session", "output_text": "smoke codex completed"}))
+if count == 1:
+    os.kill(os.getppid(), signal.SIGKILL)
+    raise SystemExit(0)
+match = re.search(r'"run_id": "(run-[0-9a-f]+)"', prompt)
+if match is None:
+    raise SystemExit(3)
+relative = f"artifacts/runs/{match.group(1)}/tests.json"
+submission = {
+    "updates": [{
+        "item_id": "verify",
+        "status": "completed",
+        "actual_evidence": [f"command:{relative}"],
+    }],
+    "command_results": [{
+        "relative": relative,
+        "exit_code": 0,
+        "argv": ["python3", "-m", "unittest"],
+        "stdout": "OK",
+        "stderr": "",
+    }],
+    "artifacts": [],
+}
+print(json.dumps({
+    "thread_id": "smoke-codex-session",
+    "item": {"type": "agent_message", "text": json.dumps(submission, sort_keys=True)},
+}))
 """,
         encoding="utf-8",
     )
     codex.chmod(0o755)
 
 
+def _json_action_submission(
+    env: dict[str, str], action: dict[str, Any], payload: dict[str, object], *, cwd: Path
+) -> dict[str, Any]:
+    stdin_contract = _object(_object(action, "submit"), "stdin")
+    _require(
+        stdin_contract == {"format": "json", "source": "payload"},
+        "action stdin contract is invalid",
+    )
+    return _json_argv(
+        env,
+        _action_argv(action, "submit"),
+        cwd=cwd,
+        input_text=json.dumps(payload),
+    )
+
+
+def _action_argv(action: dict[str, Any], key: str) -> list[str]:
+    descriptor = _object(action, key)
+    raw = descriptor.get("argv")
+    command = descriptor.get("command")
+    if not isinstance(raw, list) or not raw or not all(isinstance(value, str) for value in raw):
+        raise AssertionError(f"invalid action argv: {key}")
+    argv = list(raw)
+    if argv[0] != "twin" or command != shlex.join(argv):
+        raise AssertionError(f"action command does not match argv: {key}")
+    return argv
+
+
 def _json_command(
-    twin: Path, env: dict[str, str], *args: str, cwd: Optional[Path] = None,
+    twin: Path,
+    env: dict[str, str],
+    *args: str,
+    cwd: Optional[Path] = None,
     input_text: Optional[str] = None,
 ) -> dict[str, Any]:
-    result = _command(twin, env, *args, cwd=cwd, input_text=input_text)
+    return _json_result(
+        _command(twin, env, *args, cwd=cwd, input_text=input_text),
+        " ".join(args),
+    )
+
+
+def _json_argv(
+    env: dict[str, str],
+    argv: list[str],
+    *,
+    cwd: Optional[Path] = None,
+    input_text: Optional[str] = None,
+) -> dict[str, Any]:
+    return _json_result(
+        _command_argv(env, argv, cwd=cwd, input_text=input_text),
+        shlex.join(argv),
+    )
+
+
+def _json_result(result: subprocess.CompletedProcess[str], label: str) -> dict[str, Any]:
     if result.returncode != 0:
-        raise AssertionError(
-            f"Twin command failed ({' '.join(args)}): {result.stderr.strip()}"
-        )
+        raise AssertionError(f"Twin command failed ({label}): {result.stderr.strip()}")
     try:
         payload = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
-        raise AssertionError(f"Twin command did not emit JSON ({' '.join(args)}): {result.stdout!r}") from exc
+        raise AssertionError(f"Twin command did not emit JSON ({label}): {result.stdout!r}") from exc
     if not isinstance(payload, dict):
-        raise AssertionError(f"Twin command emitted a non-object result: {' '.join(args)}")
+        raise AssertionError(f"Twin command emitted a non-object result: {label}")
     return payload
 
 
 def _command(
-    twin: Path, env: dict[str, str], *args: str, cwd: Optional[Path] = None,
+    twin: Path,
+    env: dict[str, str],
+    *args: str,
+    cwd: Optional[Path] = None,
     input_text: Optional[str] = None,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [str(twin), *args], cwd=str(cwd) if cwd is not None else None, env=env,
-        input=input_text, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        [str(twin), *args],
+        cwd=str(cwd) if cwd is not None else None,
+        env=env,
+        input=input_text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def _command_argv(
+    env: dict[str, str],
+    argv: list[str],
+    *,
+    cwd: Optional[Path] = None,
+    input_text: Optional[str] = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        argv,
+        cwd=str(cwd) if cwd is not None else None,
+        env=env,
+        input=input_text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
     )
 
 
@@ -258,9 +426,9 @@ def _json_file(path: Path) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
-        raise AssertionError(f"missing persisted run evidence: {path}") from exc
+        raise AssertionError(f"missing persisted JSON: {path}") from exc
     if not isinstance(payload, dict):
-        raise AssertionError(f"run evidence is not an object: {path}")
+        raise AssertionError(f"persisted JSON is not an object: {path}")
     return payload
 
 
@@ -276,10 +444,6 @@ def _string(value: dict[str, Any], key: str) -> str:
     if not isinstance(child, str) or not child:
         raise AssertionError(f"missing string field: {key}")
     return child
-
-
-def _action_token_option(token: str) -> str:
-    return f"--action-token={token}"
 
 
 def _require(condition: bool, message: str) -> None:

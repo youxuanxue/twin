@@ -30,6 +30,9 @@ for pattern in "${forbidden_patterns[@]}"; do
   fi
 done
 
+python3 scripts/generate-skill-manifest.py --check
+python3 scripts/export_agent_contract.py --check
+python3 scripts/check-provider-contracts.py
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 python3 -m pip wheel --no-deps --wheel-dir "$tmp_wheels" .
 wheel="$(find "$tmp_wheels" -maxdepth 1 -name 'xuejiao_twin-*.whl' -print -quit)"

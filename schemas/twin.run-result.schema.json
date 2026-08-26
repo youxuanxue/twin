@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/youxuanxue/twin/schemas/twin.run-result.schema.json",
+  "title": "Twin run result",
+  "type": "object",
+  "required": ["schema_version", "run_id", "output_text", "returncode", "session_id", "events", "timed_out", "submission", "cleanup", "cleanup_error"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "run_id": {"type": "string", "minLength": 1},
+    "output_text": {"type": "string"},
+    "returncode": {"type": "integer"},
+    "session_id": {"type": "string"},
+    "events": {"type": "array", "items": {"type": "object"}},
+    "timed_out": {"type": "boolean"},
+    "submission": {"type": ["object", "null"]},
+    "cleanup": {"type": ["boolean", "null"]},
+    "cleanup_error": {"type": ["string", "null"]}
+  },
+  "additionalProperties": false
+}

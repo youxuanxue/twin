@@ -93,3 +93,15 @@ def _check(value: object, schema: dict[str, object], path: str, errors: list[str
             errors.append(f"{path}: longer than maxLength ({max_length})")
         if isinstance(pattern, str) and re.search(pattern, value) is None:
             errors.append(f"{path}: does not match pattern {pattern!r}")
+    all_of = schema.get("allOf")
+    if isinstance(all_of, list):
+        for child in all_of:
+            if isinstance(child, dict):
+                _check(value, child, path, errors)
+    condition = schema.get("if")
+    if isinstance(condition, dict):
+        condition_errors: list[str] = []
+        _check(value, condition, path, condition_errors)
+        branch = schema.get("then") if not condition_errors else schema.get("else")
+        if isinstance(branch, dict):
+            _check(value, branch, path, errors)

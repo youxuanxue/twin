@@ -4,6 +4,20 @@ import sysconfig
 from pathlib import Path
 
 
+SCHEMA_NAMES = (
+    "action",
+    "event",
+    "goal",
+    "meta",
+    "plan",
+    "run-evidence",
+    "run-request",
+    "run-result",
+    "state",
+    "worker-submission",
+)
+
+
 class ResourceCatalog:
     def __init__(self, root: Path | None = None) -> None:
         self.root = root if root is not None else Path(sysconfig.get_path("data")) / "share" / "twin"

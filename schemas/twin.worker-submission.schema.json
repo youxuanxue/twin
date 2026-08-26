@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/youxuanxue/twin/schemas/twin.worker-submission.schema.json",
+  "title": "Twin worker submission",
+  "type": "object",
+  "required": ["updates", "command_results", "artifacts"],
+  "properties": {
+    "updates": {"type": "array", "items": {"type": "object", "required": ["item_id"], "additionalProperties": false, "properties": {"item_id": {"type": "string", "minLength": 1}, "status": {"type": "string"}, "actual_evidence": {"type": "array", "items": {"type": "string", "minLength": 1}}, "next_action": {"type": "string"}}}},
+    "command_results": {"type": "array", "items": {"type": "object", "required": ["relative", "exit_code"], "additionalProperties": false, "properties": {"relative": {"type": "string", "minLength": 1}, "exit_code": {"type": "integer"}, "argv": {"type": "array", "items": {"type": "string"}}, "stdout": {"type": "string"}, "stderr": {"type": "string"}}}},
+    "artifacts": {"type": "array", "items": {"type": "object", "required": ["relative", "content"], "additionalProperties": false, "properties": {"relative": {"type": "string", "minLength": 1}, "content": {"type": "string"}}}}
+  },
+  "additionalProperties": false
+}

@@ -8,14 +8,18 @@ from twin.storage.atomic import write_bytes
 
 
 def load_yaml(path: Path) -> dict[str, object]:
-    lines = path.read_text(encoding="utf-8").splitlines()
+    return decode_yaml(path.read_text(encoding="utf-8"), source=str(path))
+
+
+def decode_yaml(text: str, *, source: str = "<yaml>") -> dict[str, object]:
+    lines = text.splitlines()
     index = _next_content_index(lines, 0)
     if index >= len(lines):
         return {}
     parsed, index = _parse_block(lines, index, _line_indent(lines[index]))
     index = _next_content_index(lines, index)
     if index != len(lines) or not isinstance(parsed, dict):
-        raise ValueError(f"expected mapping in {path}")
+        raise ValueError(f"expected mapping in {source}")
     return parsed
 
 
@@ -196,9 +200,7 @@ def _parse_block(lines: list[str], index: int, indent: int) -> tuple[object, int
 
 
 def _quote_scalar(value: str) -> str:
-    if value == "" or value != value.strip() or any(char in value for char in ":#[]{}\n"):
-        return "'" + value.replace("'", "''") + "'"
-    return value
+    return "'" + value.replace("'", "''") + "'"
 
 
 def _dump_scalar(value: object) -> str:

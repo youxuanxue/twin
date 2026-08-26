@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/youxuanxue/twin/schemas/twin.run-request.schema.json",
+  "title": "Twin run request",
+  "type": "object",
+  "required": ["schema_version", "workspace_id", "run_id", "item_id", "repository_root", "repository_identity", "adapter", "provider", "config_digest", "provider_contract_version", "prompt", "session_id", "timeout_seconds", "environment"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "workspace_id": {"type": "string", "minLength": 1},
+    "run_id": {"type": "string", "minLength": 1},
+    "item_id": {"type": "string", "minLength": 1},
+    "repository_root": {"type": "string", "minLength": 1},
+    "repository_identity": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "adapter": {"type": "string", "minLength": 1},
+    "provider": {"type": "string", "minLength": 1},
+    "config_digest": {"type": "string", "minLength": 1},
+    "provider_contract_version": {"type": "integer", "minimum": 1},
+    "prompt": {"type": "string", "minLength": 1},
+    "session_id": {"type": "string"},
+    "timeout_seconds": {"type": "number", "minimum": 0},
+    "environment": {"type": "object", "additionalProperties": {"type": "string"}}
+  },
+  "additionalProperties": false
+}

@@ -3,12 +3,25 @@
   "$id": "https://github.com/youxuanxue/twin/schemas/twin.state.schema.json",
   "title": "Twin state",
   "type": "object",
-  "required": ["schema_version", "workspace_id", "status", "state_revision", "supervisor_route", "pending_action"],
+  "required": ["schema_version", "workspace_id", "status", "state_revision", "supervisor_route", "repository_identity", "pending_action"],
   "properties": {
     "schema_version": {"const": 1}, "workspace_id": {"type": "string", "minLength": 1},
     "status": {"type": "string", "enum": ["awaiting_plan", "ready", "worker_running", "review_required", "needs_human", "accepted_done", "failed"]},
     "state_revision": {"type": "integer", "minimum": 0}, "supervisor_route": {"type": ["string", "null"]},
-    "pending_action": {"type": ["object", "null"], "additionalProperties": false, "properties": {"kind": {"type": "string"}, "state_revision": {"type": "integer", "minimum": 0}, "route": {"type": "string"}, "token_hash": {"type": "string"}, "run_id": {"type": ["string", "null"]}}},
+    "repository_identity": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "pending_action": {
+      "type": ["object", "null"],
+      "required": ["kind", "state_revision", "route", "token_hash", "run_id", "repository_identity"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {"type": "string", "enum": ["author_plan", "review"]},
+        "state_revision": {"type": "integer", "minimum": 0},
+        "route": {"type": "string", "minLength": 1},
+        "token_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "run_id": {"type": ["string", "null"], "minLength": 1},
+        "repository_identity": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
     "current_run_id": {"type": ["string", "null"]}, "current_item_id": {"type": ["string", "null"]}, "terminal_summary": {"type": ["string", "null"]},
     "metadata": {"type": "object", "maxProperties": 16, "additionalProperties": {"type": ["string", "number", "boolean", "null"]}}
   }, "additionalProperties": false

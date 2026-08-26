@@ -1,6 +1,8 @@
 import json
 import os
 import shutil
+import subprocess
+import sys
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -100,7 +102,7 @@ class SetupOwnershipTest(TestCase):
     def test_setup_check_and_doctor_report_use_installed_skill_links(self) -> None:
         install_skill(self.paths, self.resources, self.home)
 
-        links = check_skill_links(self.paths, self.home)
+        links = check_skill_links(self.paths, self.home, resources=self.resources)
         self.assertTrue(all(link.ok for link in links))
 
         with patch("twin.doctor.shutil.which", return_value="/usr/bin/git"):
@@ -118,7 +120,8 @@ class SetupOwnershipTest(TestCase):
         payload = json.loads(output.getvalue())
         self.assertTrue(payload["ok"])
         self.assertEqual(set(payload["links"]), {
-            "cursor_skill", "claude_skill", "codex_skill", "antigravity_skill",
+            "installed_skill", "cursor_skill", "claude_skill", "codex_skill",
+            "antigravity_skill",
         })
 
     def test_setup_check_rejects_legacy_cursor_registry_link(self) -> None:
@@ -163,6 +166,47 @@ class SetupOwnershipTest(TestCase):
         self.assertEqual(
             (self.home / ".cursor" / "skills").resolve(), legacy_registry.resolve()
         )
+
+    def test_setup_check_and_doctor_reject_installed_skill_tree_drift(self) -> None:
+        install_skill(self.paths, self.resources, self.home)
+        installed = self.paths.installed_skills / "twin"
+        cases = ("changed", "missing", "extra", "symlink")
+        for case in cases:
+            with self.subTest(case=case):
+                install_skill(self.paths, self.resources, self.home)
+                if case == "changed":
+                    (installed / "SKILL.md").write_text("changed\n", encoding="utf-8")
+                elif case == "missing":
+                    (installed / "agents" / "openai.yaml").unlink()
+                elif case == "extra":
+                    (installed / "extra.txt").write_text("extra\n", encoding="utf-8")
+                else:
+                    (installed / "SKILL.md").unlink()
+                    (installed / "SKILL.md").symlink_to(self.root / "foreign-skill")
+                try:
+                    links = check_skill_links(
+                        self.paths, self.home, resources=self.resources
+                    )
+                except TypeError as exc:
+                    self.fail(f"setup check cannot compare packaged resources: {exc}")
+                by_name = {link.name: link for link in links}
+                self.assertFalse(by_name["installed_skill"].ok)
+                self.assertIn("drift", by_name["installed_skill"].detail)
+                with patch("twin.doctor.shutil.which", return_value="/usr/bin/git"):
+                    report = doctor_report(self.paths, self.resources)
+                self.assertFalse(report["ok"])
+                self.assertFalse(report["checks"]["installed_skill"]["ok"])
+
+    def test_checked_in_skill_manifest_matches_the_packaged_tree(self) -> None:
+        script = Path(__file__).resolve().parents[1] / "scripts" / "generate-skill-manifest.py"
+        result = subprocess.run(
+            [sys.executable, str(script), "--check"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def _replace_cursor_registry_with_legacy_link(self) -> Path:
         install_skill(self.paths, self.resources, self.home)

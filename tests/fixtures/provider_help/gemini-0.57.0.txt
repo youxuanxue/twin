@@ -1,0 +1,3 @@
+0.57.0
+-p, --prompt                    Run in non-interactive headless mode
+--output-format                 choices: "text", "json", "stream-json"

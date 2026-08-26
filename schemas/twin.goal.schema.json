@@ -9,8 +9,8 @@
     "id": {"type": "string", "minLength": 1},
     "one_liner": {"type": "string", "minLength": 1},
     "core_goal": {"type": "string", "minLength": 1},
-    "acceptance_criteria": {"type": "array"},
-    "non_goals": {"type": "array"}
+    "acceptance_criteria": {"type": "array", "items": {"type": "object", "required": ["id", "statement", "evidence_type"], "properties": {"id": {"type": "string", "minLength": 1}, "statement": {"type": "string", "minLength": 1}, "evidence_type": {"type": "string", "minLength": 1}, "metadata": {"type": "object", "maxProperties": 16, "additionalProperties": {"type": ["string", "number", "boolean", "null"]}}}, "additionalProperties": false}},
+    "non_goals": {"type": "array", "items": {"type": "string"}}
   },
   "additionalProperties": false
 }

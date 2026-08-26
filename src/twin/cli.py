@@ -10,9 +10,10 @@ from typing import Callable, Sequence
 from twin.contract import render_contract
 from twin.doctor import doctor_report
 from twin.domain.service import TwinService
+from twin.errors import WorkspaceBusyError
 from twin.paths import TwinPaths
 from twin.resources import ResourceCatalog
-from twin.runtime.local_cli import LocalCliRuntime
+from twin.runtime.config import build_runtime, load_runtime_config
 from twin.runtime.worktree import GitWorkspaceIsolation
 from twin.setup import LinkResult, check_skill_links, install_skill, uninstall_skill
 from twin.storage.workspaces import WorkspaceStore
@@ -62,7 +63,10 @@ def build_parser() -> argparse.ArgumentParser:
         return command
 
     action_schema = "schemas/twin.action.schema.json"
-    result_output = {"shape": "workspace-result"}
+    result_output = {
+        "shape": "workspace-result",
+        "continuation_field": "next_command",
+    }
     start = add_command(
         "start", visibility="public",
         argv=["start", "<goal>", "--supervisor", "host/<provider>", "--json"],
@@ -143,16 +147,7 @@ def build_parser() -> argparse.ArgumentParser:
         ["submit-plan", "--workspace", "<id>", "--supervisor", "host/<provider>",
          "--state-revision", "<int>", "--action-token", "<token>", "--payload-file", "-", "--json"],
         "submit a plan for a pending author action",
-        output={"shape": "workspace-result"},
-    )
-    _add_submission_command(
-        add_command, "submit-instruction",
-        ["submit-instruction", "--workspace", "<id>", "--supervisor", "host/<provider>",
-         "--state-revision", "<int>", "--action-token", "<token>", "--run-id", "<id>",
-         "--payload-file", "-", "--json"],
-        "submit a worker instruction result",
-        output={"shape": "action", "schema_path": action_schema},
-        needs_run_id=True,
+        output=result_output,
     )
     _add_submission_command(
         add_command, "submit-review",
@@ -160,7 +155,7 @@ def build_parser() -> argparse.ArgumentParser:
          "--state-revision", "<int>", "--action-token", "<token>", "--run-id", "<id>",
          "--payload-file", "-", "--json"],
         "submit a review decision",
-        output={"shape": "workspace-result"},
+        output=result_output,
         needs_run_id=True,
     )
     return parser
@@ -177,7 +172,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         paths = _paths_for_home()
         resources = _resource_catalog()
         result = _dispatch(args, paths, resources)
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError, WorkspaceBusyError, json.JSONDecodeError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
     _emit(result, as_json=args.json)
@@ -193,13 +188,15 @@ def _dispatch(
     if command == "doctor":
         return doctor_report(paths, resources)
     if command == "setup":
-        links = check_skill_links(paths, paths.root.parent) if args.check else install_skill(
-            paths, resources, paths.root.parent
+        links = (
+            check_skill_links(paths, paths.root.parent, resources=resources)
+            if args.check
+            else install_skill(paths, resources, paths.root.parent)
         )
         return _link_report(links)
     if command == "uninstall":
         return _link_report(uninstall_skill(paths, paths.root.parent))
-    service = _service(paths, resources)
+    service = _service(paths, resources, require_runtime=command == "run")
     repo_root = Path.cwd()
     if command == "start":
         return service.start(args.goal, repo_root, args.supervisor)
@@ -216,10 +213,6 @@ def _dispatch(
         return service.submit_plan(
             args.workspace, args.supervisor, args.state_revision, args.action_token, payload
         )
-    if command == "submit-instruction":
-        return service.submit_instruction(
-            args.workspace, args.supervisor, args.state_revision, args.action_token, args.run_id, payload
-        )
     if command == "submit-review":
         return service.submit_review(
             args.workspace, args.supervisor, args.state_revision, args.action_token, args.run_id, payload
@@ -227,10 +220,23 @@ def _dispatch(
     raise ValueError(f"unknown command: {command}")
 
 
-def _service(paths: TwinPaths, resources: ResourceCatalog) -> TwinService:
+def _service(
+    paths: TwinPaths, resources: ResourceCatalog, *, require_runtime: bool = False
+) -> TwinService:
+    if not require_runtime:
+        return TwinService(WorkspaceStore(paths), resources=resources)
+    config = load_runtime_config(paths.config)
+    runtime = build_runtime(config)
     return TwinService(
-        WorkspaceStore(paths), runtime=LocalCliRuntime(), isolation=GitWorkspaceIsolation(),
+        WorkspaceStore(paths),
+        runtime=runtime,
+        isolation=GitWorkspaceIsolation(),
         resources=resources,
+        timeout_seconds=config.timeout_seconds,
+        worker_provider=config.worker_provider,
+        runtime_adapter=config.adapter,
+        runtime_config_digest=config.digest,
+        provider_contract_version=getattr(runtime, "contract_version", 1),
     )
 
 

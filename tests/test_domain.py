@@ -1,9 +1,11 @@
+import copy
 import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import shlex
 from tempfile import TemporaryDirectory
 import textwrap
 from unittest.mock import patch
@@ -12,7 +14,10 @@ from unittest import TestCase
 from twin.domain.service import TwinService
 from twin.paths import TwinPaths
 from twin.resources import ResourceCatalog
+from twin.runtime.protocols import WorkerTurnRequest, WorkerTurnResult
+from twin.schema import validate_document
 from twin.storage.workspaces import WorkspaceStore
+from twin.yaml_codec import load_yaml
 
 
 def valid_goal_and_plan() -> dict[str, object]:
@@ -77,23 +82,17 @@ class TwinServiceTest(TestCase):
         self.repo = root / "repo"
         self.repo.mkdir()
         self.store = WorkspaceStore(TwinPaths.for_home(root / "home"))
+        self.runtime = _DomainRuntime()
         self.service = TwinService(
-            self.store, resources=ResourceCatalog(Path(__file__).resolve().parents[1])
+            self.store,
+            runtime=self.runtime,
+            resources=ResourceCatalog(Path(__file__).resolve().parents[1]),
         )
 
     def start_and_submit_plan(self) -> dict[str, object]:
         action = self.service.start("ship feature", self.repo, "host/codex")
         return self.service.submit_plan(
             action["workspace"], "host/codex", action["state_revision"], action["action_token"], valid_goal_and_plan()
-        )
-
-    def start_run_and_submit_instruction(self, updates: list[dict[str, object]]) -> dict[str, object]:
-        self.start_and_submit_plan()
-        action = self.service.run(None, self.repo, "host/codex")
-        run_id = action["context"]["metadata"]["run_id"]
-        return self.service.submit_instruction(
-            action["workspace"], "host/codex", action["state_revision"], action["action_token"],
-            run_id, {"updates": updates},
         )
 
     @staticmethod
@@ -107,12 +106,144 @@ class TwinServiceTest(TestCase):
         action = self.service.start("ship feature", self.repo, "host/codex")
         self.assertEqual(action["action"], "author_plan")
         self.assertEqual(action["state_revision"], 1)
-        self.assertIn("submit-plan", action["submit"]["command"])
+        repository = action.get("repository")
+        self.assertIsInstance(repository, dict)
+        assert isinstance(repository, dict)
+        self.assertEqual(repository["root"], str(self.repo.resolve()))
+        self.assertEqual(len(repository["identity"]), 64)
+        self.assertEqual(action["context"]["goal_request"], "ship feature")
+        self.assertEqual(action["context"]["goal"]["id"], action["workspace"])
+        self.assertEqual(action["context"]["plan"]["goal_id"], action["workspace"])
+        self.assertEqual(
+            action["expected_output"]["payload"]["required"], ["goal", "plan"],
+        )
+        expected_argv = [
+            "twin", "submit-plan", "--workspace", action["workspace"], "--supervisor",
+            "host/codex", "--state-revision", "1",
+            f"--action-token={action['action_token']}", "--payload-file", "-", "--json",
+        ]
+        self.assertEqual(action["submit"]["argv"], expected_argv)
+        self.assertEqual(action["submit"]["command"], shlex.join(expected_argv))
+        self.assertIsNone(action["next_command"])
+        self.assertEqual(validate_document(action, "action", self.service.resources), [])
+
+    def test_workspace_results_drive_dynamic_lifecycle_continuation(self) -> None:
+        author = self.service.start("ship feature", self.repo, "host/codex")
+        self.assertIsNone(author["next_command"])
+
+        planned = self.service.submit_plan(
+            author["workspace"], "host/codex", author["state_revision"],
+            author["action_token"], valid_goal_and_plan(),
+        )
+        run_argv = [
+            "twin", "run", author["workspace"], "--supervisor", "host/codex", "--json",
+        ]
+        run_command = {"argv": run_argv, "command": shlex.join(run_argv)}
+        self.assertEqual(planned["next_command"], run_command)
+
+        review = self.service.run(planned["workspace"], self.repo, "host/codex")
+        self.assertIsNone(review["next_command"])
+        changes_requested = self.service.submit_review(
+            review["workspace"], "host/codex", review["state_revision"],
+            review["action_token"], review["context"]["run"]["run_id"],
+            {"decision": "changes_requested"},
+        )
+        self.assertEqual(changes_requested["next_command"], run_command)
+
+        review = self.service.run(planned["workspace"], self.repo, "host/codex")
+        needs_human = self.service.submit_review(
+            review["workspace"], "host/codex", review["state_revision"],
+            review["action_token"], review["context"]["run"]["run_id"],
+            {"decision": "needs_human"},
+        )
+        self.assertIsNone(needs_human["next_command"])
+
+        resumed = self.service.respond(
+            needs_human["workspace"], self.repo, "continue",
+        )
+        self.assertEqual(resumed["next_command"], run_command)
+
+        self.runtime.complete_with_evidence()
+        review = self.service.run(resumed["workspace"], self.repo, "host/codex")
+        accepted = self.service.submit_review(
+            review["workspace"], "host/codex", review["state_revision"],
+            review["action_token"], review["context"]["run"]["run_id"],
+            {"decision": "accepted"},
+        )
+        self.assertIsNone(accepted["next_command"])
+
+    def test_action_schema_requires_executable_next_command_descriptor(self) -> None:
+        action = self.service.start("ship feature", self.repo, "host/codex")
+        cases = (
+            ({"argv": ["twin", "run"]}, "command"),
+            ({"command": "twin run"}, "argv"),
+        )
+
+        for descriptor, missing in cases:
+            with self.subTest(missing=missing):
+                candidate = dict(action)
+                candidate["next_command"] = descriptor
+                self.assertIn(
+                    f"$.next_command: missing required '{missing}'",
+                    validate_document(candidate, "action", self.service.resources),
+                )
+
+    def test_action_schema_requires_action_specific_context_and_output_contracts(self) -> None:
+        author = self.service.start("ship feature", self.repo, "host/codex")
+        ready = self.service.submit_plan(
+            author["workspace"], "host/codex", author["state_revision"],
+            author["action_token"], valid_goal_and_plan(),
+        )
+        review = self.service.run(ready["workspace"], self.repo, "host/codex")
+
+        missing_author_context = copy.deepcopy(author)
+        del missing_author_context["context"]["goal_request"]
+        missing_author_output = copy.deepcopy(author)
+        del missing_author_output["expected_output"]["payload"]["schema_paths"]
+        missing_review_context = copy.deepcopy(review)
+        del missing_review_context["context"]["run"]["evidence"]
+        missing_review_output = copy.deepcopy(review)
+        del missing_review_output["expected_output"]["payload"]["decision_values"]
+
+        cases = (
+            (missing_author_context, "$.context: missing required 'goal_request'"),
+            (missing_author_output, "$.expected_output.payload: missing required 'schema_paths'"),
+            (missing_review_context, "$.context.run: missing required 'evidence'"),
+            (missing_review_output, "$.expected_output.payload: missing required 'decision_values'"),
+        )
+        for candidate, expected_error in cases:
+            with self.subTest(expected_error=expected_error):
+                self.assertIn(
+                    expected_error,
+                    validate_document(candidate, "action", self.service.resources),
+                )
+
+    def test_explicit_workspace_commands_reject_a_different_repository(self) -> None:
+        action = self.service.start("ship feature", self.repo, "host/codex")
+        self.service.submit_plan(
+            action["workspace"], "host/codex", action["state_revision"], action["action_token"],
+            valid_goal_and_plan(),
+        )
+        other_repo = self.repo.parent / "other-repo"
+        other_repo.mkdir()
+        cases = (
+            lambda: self.service.run(action["workspace"], other_repo, "host/codex"),
+            lambda: self.service.respond(action["workspace"], other_repo, "continue"),
+            lambda: self.service.status(action["workspace"], other_repo),
+            lambda: self.service.handoff(
+                action["workspace"], other_repo, "host/codex", "host/claude",
+            ),
+        )
+        for operation in cases:
+            with self.subTest(operation=operation):
+                with self.assertRaisesRegex(ValueError, "workspace repository mismatch"):
+                    operation()
 
     def test_run_action_identifies_the_runnable_plan_item(self) -> None:
         self.start_and_submit_plan()
         action = self.service.run(None, self.repo, "host/codex")
-        self.assertEqual(action["context"]["metadata"]["item_id"], "implement")
+        self.assertEqual(action["action"], "review")
+        self.assertEqual(action["context"]["run"]["item_id"], "implement")
 
     def test_action_token_is_single_use(self) -> None:
         action = self.service.start("ship feature", self.repo, "host/codex")
@@ -143,6 +274,79 @@ class TwinServiceTest(TestCase):
                 action["workspace"], "host/codex", action["state_revision"], action["action_token"], payload
             )
 
+    def test_submit_plan_rejects_malformed_acceptance_criteria(self) -> None:
+        action = self.service.start("ship feature", self.repo, "host/codex")
+        payload = valid_goal_and_plan()
+        goal = payload["goal"]
+        assert isinstance(goal, dict)
+        goal["acceptance_criteria"] = ["ac-1"]
+
+        with self.assertRaisesRegex(ValueError, r"acceptance_criteria\[0\] must be object"):
+            self.service.submit_plan(
+                action["workspace"], "host/codex", action["state_revision"], action["action_token"], payload
+            )
+
+    def test_submit_plan_requires_nonempty_verification_and_actionable_item_fields(self) -> None:
+        action = self.service.start("ship feature", self.repo, "host/codex")
+        payload = valid_goal_and_plan()
+        plan = payload["plan"]
+        assert isinstance(plan, dict)
+        plan["verification"] = []
+        item = plan["items"][0]
+        assert isinstance(item, dict)
+        del item["deliverable"]
+
+        with self.assertRaisesRegex(ValueError, "verification must contain at least one command"):
+            self.service.submit_plan(
+                action["workspace"], "host/codex", action["state_revision"], action["action_token"], payload
+            )
+
+    def test_submit_plan_requires_at_least_one_runnable_item(self) -> None:
+        action = self.service.start("ship feature", self.repo, "host/codex")
+        payload = valid_goal_and_plan()
+        plan = payload["plan"]
+        assert isinstance(plan, dict)
+        item = plan["items"][0]
+        assert isinstance(item, dict)
+        item["status"] = "completed"
+
+        with self.assertRaisesRegex(ValueError, "at least one runnable item"):
+            self.service.submit_plan(
+                action["workspace"], "host/codex", action["state_revision"],
+                action["action_token"], payload,
+            )
+
+    def test_submit_plan_rejects_duplicate_acceptance_criterion_ids(self) -> None:
+        action = self.service.start("ship feature", self.repo, "host/codex")
+        payload = valid_goal_and_plan()
+        goal = payload["goal"]
+        assert isinstance(goal, dict)
+        goal["acceptance_criteria"].append({
+            "id": "ac-1", "statement": "Duplicate", "evidence_type": "artifact",
+        })
+
+        with self.assertRaisesRegex(ValueError, "duplicate acceptance criterion id: ac-1"):
+            self.service.submit_plan(
+                action["workspace"], "host/codex", action["state_revision"], action["action_token"], payload
+            )
+
+    def test_submit_plan_round_trips_ambiguous_strings_without_type_drift(self) -> None:
+        action = self.service.start("ship feature", self.repo, "host/codex")
+        payload = valid_goal_and_plan()
+        goal = payload["goal"]
+        plan = payload["plan"]
+        assert isinstance(goal, dict) and isinstance(plan, dict)
+        goal["one_liner"] = "true"
+        plan["items"][0]["next_action"] = "123"
+
+        self.service.submit_plan(
+            action["workspace"], "host/codex", action["state_revision"], action["action_token"], payload
+        )
+
+        workspace = self.store.resolve(str(action["workspace"]), self.repo)
+        self.assertEqual(load_yaml(workspace / "goal.yaml")["one_liner"], "true")
+        self.assertEqual(load_yaml(workspace / "plan.yaml")["items"][0]["next_action"], "123")
+
     def test_submit_plan_reports_the_committed_revision(self) -> None:
         action = self.service.start("ship feature", self.repo, "host/codex")
         result = self.service.submit_plan(
@@ -168,64 +372,83 @@ class TwinServiceTest(TestCase):
             "status": "pending",
             "next_action": "Verify after implementation",
         })
-        self.service.submit_plan(action["workspace"], "host/codex", action["state_revision"], action["action_token"], payload)
-        run = self.service.run(None, self.repo, "host/codex")
-        workspace = self.store.resolve(str(run["workspace"]), self.repo)
-        self.store.write_artifact(workspace, "artifacts/verify.txt", b"verified")
-        with self.assertRaisesRegex(ValueError, "dependencies not completed"):
-            self.service.submit_instruction(
-                run["workspace"], "host/codex", run["state_revision"], run["action_token"], run["context"]["metadata"]["run_id"],
-                {"updates": [{"item_id": "verify", "status": "completed", "actual_evidence": ["artifacts/verify.txt"]}]},
-            )
+        self.service.submit_plan(
+            action["workspace"], "host/codex", action["state_revision"],
+            action["action_token"], payload,
+        )
+        self.runtime.submission = {
+            "updates": [{
+                "item_id": "verify", "status": "completed",
+                "actual_evidence": ["artifacts/verify.txt"],
+            }],
+            "command_results": [],
+            "artifacts": [{"relative": "artifacts/verify.txt", "content": "verified"}],
+        }
 
-    def test_wrong_run_id_cannot_submit_instruction(self) -> None:
-        self.start_and_submit_plan()
-        action = self.service.run(None, self.repo, "host/codex")
-        with self.assertRaisesRegex(ValueError, "run ID mismatch"):
-            self.service.submit_instruction(
-                action["workspace"], "host/codex", action["state_revision"], action["action_token"],
-                "wrong-run", {"updates": []},
+        review = self.service.run(None, self.repo, "host/codex")
+
+        self.assertEqual(review["context"]["run"]["status"], "failed")
+        workspace = self.store.resolve(str(review["workspace"]), self.repo)
+        result = json.loads(
+            (workspace / "runs" / review["context"]["run"]["run_id"] / "result.json").read_text(
+                encoding="utf-8"
             )
+        )
+        self.assertIn("dependencies not completed", result["events"][-1]["error"])
+
+    def test_run_without_a_configured_runtime_fails_before_mutating_ready_state(self) -> None:
+        self.start_and_submit_plan()
+        workspace = self.store.resolve(None, self.repo)
+        before = self.store.load_state(workspace)
+        service = TwinService(self.store, resources=self.service.resources)
+
+        with self.assertRaisesRegex(ValueError, "worker runtime is not configured"):
+            service.run(None, self.repo, "host/codex")
+
+        self.assertEqual(self.store.load_state(workspace), before)
 
     def test_completion_requires_stored_evidence(self) -> None:
         self.start_and_submit_plan()
-        run = self.service.run(None, self.repo, "host/codex")
-        with self.assertRaisesRegex(ValueError, "missing evidence"):
-            self.service.submit_instruction(
-                run["workspace"], "host/codex", run["state_revision"], run["action_token"], run["context"]["metadata"]["run_id"],
-                {"updates": [{"item_id": "implement", "status": "completed", "actual_evidence": ["artifacts/evidence.txt"]}]},
-            )
+        self.runtime.submission = {
+            "updates": [{
+                "item_id": "implement", "status": "completed",
+                "actual_evidence": ["artifacts/evidence.txt"],
+            }],
+            "command_results": [],
+            "artifacts": [],
+        }
+
+        review = self.service.run(None, self.repo, "host/codex")
+
+        self.assertEqual(review["context"]["run"]["status"], "failed")
 
     def test_accepted_completion_requires_evidence_for_each_criterion(self) -> None:
         self.start_and_submit_plan()
-        run = self.service.run(None, self.repo, "host/codex")
-        workspace = self.store.resolve(str(run["workspace"]), self.repo)
-        self.store.write_artifact(workspace, "artifacts/evidence.txt", b"verified")
-        review = self.service.submit_instruction(
-            run["workspace"], "host/codex", run["state_revision"], run["action_token"], run["context"]["metadata"]["run_id"],
-            {"updates": [
-            {"item_id": "implement", "status": "completed", "actual_evidence": ["artifacts/evidence.txt"]},
-            ]},
-        )
+        self.runtime.complete_with_evidence()
+        review = self.service.run(None, self.repo, "host/codex")
         result = self.service.submit_review(
-            review["workspace"], "host/codex", review["state_revision"], review["action_token"], review["context"]["metadata"]["run_id"],
+            review["workspace"], "host/codex", review["state_revision"], review["action_token"],
+            review["context"]["run"]["run_id"],
             {"decision": "accepted"},
         )
         self.assertEqual(result["status"], "accepted_done")
 
     def test_undeclared_stored_evidence_cannot_complete_an_acceptance_criterion(self) -> None:
         self.start_and_submit_plan()
-        run = self.service.run(None, self.repo, "host/codex")
-        workspace = self.store.resolve(str(run["workspace"]), self.repo)
-        self.store.write_artifact(workspace, "artifacts/undeclared.txt", b"verified")
-        with self.assertRaisesRegex(ValueError, "undeclared evidence"):
-            self.service.submit_instruction(
-                run["workspace"], "host/codex", run["state_revision"], run["action_token"],
-                run["context"]["metadata"]["run_id"],
-                {"updates": [{"item_id": "implement", "status": "completed", "actual_evidence": ["artifacts/undeclared.txt"]}]},
-            )
+        self.runtime.submission = {
+            "updates": [{
+                "item_id": "implement", "status": "completed",
+                "actual_evidence": ["artifacts/undeclared.txt"],
+            }],
+            "command_results": [],
+            "artifacts": [{"relative": "artifacts/undeclared.txt", "content": "verified"}],
+        }
 
-    def test_ac_bearing_item_with_an_empty_evidence_plan_cannot_complete(self) -> None:
+        review = self.service.run(None, self.repo, "host/codex")
+
+        self.assertEqual(review["context"]["run"]["status"], "failed")
+
+    def test_ac_bearing_item_with_an_empty_evidence_plan_cannot_become_ready(self) -> None:
         action = self.service.start("ship feature", self.repo, "host/codex")
         payload = valid_goal_and_plan()
         plan = payload["plan"]
@@ -235,13 +458,10 @@ class TwinServiceTest(TestCase):
         item = items[0]
         assert isinstance(item, dict)
         item["evidence_plan"] = []
-        self.service.submit_plan(action["workspace"], "host/codex", action["state_revision"], action["action_token"], payload)
-        run = self.service.run(None, self.repo, "host/codex")
-        with self.assertRaisesRegex(ValueError, "missing evidence"):
-            self.service.submit_instruction(
-                run["workspace"], "host/codex", run["state_revision"], run["action_token"],
-                run["context"]["metadata"]["run_id"],
-                {"updates": [{"item_id": "implement", "status": "completed", "actual_evidence": []}]},
+        with self.assertRaisesRegex(ValueError, "evidence_plan is required"):
+            self.service.submit_plan(
+                action["workspace"], "host/codex", action["state_revision"],
+                action["action_token"], payload,
             )
 
     def test_plan_commit_failure_leaves_documents_state_and_token_unchanged(self) -> None:
@@ -929,14 +1149,16 @@ class TwinServiceTest(TestCase):
         self.assertFalse((workspace / "artifacts" / "human" / f"{digest}.txt").exists())
 
     def test_terminal_workspace_cannot_mutate(self) -> None:
-        action = self.service.start("ship feature", self.repo, "host/codex")
-        workspace = self.store.resolve(str(action["workspace"]), self.repo)
-        state = self.store.load_state(workspace)
-        state["status"] = "accepted_done"
-        state["pending_action"] = None
-        self.store.replace_state(workspace, action["state_revision"], state)
+        self.start_and_submit_plan()
+        self.runtime.complete_with_evidence()
+        review = self.service.run(None, self.repo, "host/codex")
+        self.service.submit_review(
+            review["workspace"], "host/codex", review["state_revision"],
+            review["action_token"], review["context"]["run"]["run_id"],
+            {"decision": "accepted"},
+        )
         with self.assertRaisesRegex(ValueError, "terminal workspace"):
-            self.service.run(action["workspace"], self.repo, "host/codex")
+            self.service.run(review["workspace"], self.repo, "host/codex")
 
     def test_handoff_rejects_pending_action(self) -> None:
         action = self.service.start("ship feature", self.repo, "host/codex")
@@ -957,15 +1179,7 @@ class TwinServiceTest(TestCase):
             self.service.status(action["workspace"], self.repo)
 
     def test_respond_writes_hash_named_artifact_without_answer_in_event(self) -> None:
-        self.start_and_submit_plan()
-        run = self.service.run(None, self.repo, "host/codex")
-        review = self.service.submit_instruction(
-            run["workspace"], "host/codex", run["state_revision"], run["action_token"], run["context"]["metadata"]["run_id"], {"updates": []}
-        )
-        human = self.service.submit_review(
-            review["workspace"], "host/codex", review["state_revision"], review["action_token"], review["context"]["metadata"]["run_id"],
-            {"decision": "needs_human"},
-        )
+        human = self._needs_human_workspace()
         result = self.service.respond(human["workspace"], self.repo, "sensitive approval")
         body = b"sensitive approval"
         workspace = self.store.resolve(str(human["workspace"]), self.repo)
@@ -976,12 +1190,36 @@ class TwinServiceTest(TestCase):
 
     def _needs_human_workspace(self) -> dict[str, object]:
         self.start_and_submit_plan()
-        run = self.service.run(None, self.repo, "host/codex")
-        review = self.service.submit_instruction(
-            run["workspace"], "host/codex", run["state_revision"], run["action_token"],
-            run["context"]["metadata"]["run_id"], {"updates": []},
-        )
+        review = self.service.run(None, self.repo, "host/codex")
         return self.service.submit_review(
             review["workspace"], "host/codex", review["state_revision"], review["action_token"],
-            review["context"]["metadata"]["run_id"], {"decision": "needs_human"},
+            review["context"]["run"]["run_id"], {"decision": "needs_human"},
+        )
+
+
+class _DomainRuntime:
+    def __init__(self) -> None:
+        self.submission: dict[str, object] = {
+            "updates": [],
+            "command_results": [],
+            "artifacts": [],
+        }
+
+    def complete_with_evidence(self) -> None:
+        self.submission = {
+            "updates": [{
+                "item_id": "implement", "status": "completed",
+                "actual_evidence": ["artifacts/evidence.txt"],
+            }],
+            "command_results": [],
+            "artifacts": [{"relative": "artifacts/evidence.txt", "content": "verified"}],
+        }
+
+    def run_turn(self, request: WorkerTurnRequest) -> WorkerTurnResult:
+        return WorkerTurnResult(
+            output_text="domain test worker",
+            returncode=0,
+            session_id="domain-test",
+            events=({"event": "completed", "provider": request.provider},),
+            submission=self.submission,
         )

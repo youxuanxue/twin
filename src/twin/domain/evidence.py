@@ -6,12 +6,17 @@ from typing import Mapping
 
 
 def evidence_exists(
-    workspace: Path, entry: str, staged_artifacts: Mapping[str, bytes] | None = None
+    workspace: Path,
+    entry: str,
+    staged_artifacts: Mapping[str, bytes] | None = None,
+    recorded_artifacts: Mapping[str, Mapping[str, object]] | None = None,
 ) -> bool:
     relative = entry.removeprefix("command:") if entry.startswith("command:") else entry
     staged = staged_artifacts.get(relative) if staged_artifacts is not None else None
     if staged is not None:
         return _successful_command_bytes(staged) if entry.startswith("command:") else True
+    if recorded_artifacts is not None and relative not in recorded_artifacts:
+        return False
     if entry.startswith("command:"):
         return _successful_command(workspace, relative)
     return _stored_artifact(workspace, entry)

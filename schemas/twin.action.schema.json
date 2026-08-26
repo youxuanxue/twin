@@ -3,11 +3,182 @@
   "$id": "https://github.com/youxuanxue/twin/schemas/twin.action.schema.json",
   "title": "Twin action",
   "type": "object",
-  "required": ["contract_version", "action", "workspace", "supervisor_route", "state_revision", "action_token", "context", "expected_output", "submit"],
+  "required": ["contract_version", "action", "workspace", "supervisor_route", "state_revision", "action_token", "repository", "context", "expected_output", "submit", "next_command"],
   "properties": {
-    "contract_version": {"const": 1}, "action": {"type": "string", "minLength": 1}, "workspace": {"type": "string", "minLength": 1}, "supervisor_route": {"type": "string", "minLength": 1}, "state_revision": {"type": "integer", "minimum": 0}, "action_token": {"type": "string", "minLength": 1},
-    "context": {"type": "object", "additionalProperties": false, "properties": {"metadata": {"type": "object", "maxProperties": 16, "additionalProperties": {"type": ["string", "number", "boolean", "null"]}}}},
-    "expected_output": {"type": "object", "additionalProperties": false, "properties": {"metadata": {"type": "object", "maxProperties": 16, "additionalProperties": {"type": ["string", "number", "boolean", "null"]}}}},
-    "submit": {"type": "object", "additionalProperties": false, "properties": {"command": {"type": "string"}, "metadata": {"type": "object", "maxProperties": 16, "additionalProperties": {"type": ["string", "number", "boolean", "null"]}}}}
-  }, "additionalProperties": false
+    "contract_version": {"const": 1},
+    "action": {"type": "string", "enum": ["author_plan", "review"]},
+    "workspace": {"type": "string", "minLength": 1},
+    "supervisor_route": {"type": "string", "minLength": 1},
+    "state_revision": {"type": "integer", "minimum": 0},
+    "action_token": {"type": "string", "minLength": 1},
+    "repository": {
+      "type": "object",
+      "required": ["root", "identity"],
+      "additionalProperties": false,
+      "properties": {
+        "root": {"type": "string", "minLength": 1},
+        "identity": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "goal_request": {"type": "string"},
+        "goal": {"type": "object"},
+        "plan": {"type": "object"},
+        "run": {"type": "object"}
+      }
+    },
+    "expected_output": {
+      "type": "object",
+      "required": ["payload"],
+      "additionalProperties": false,
+      "properties": {"payload": {"type": "object"}}
+    },
+    "submit": {
+      "type": "object",
+      "required": ["argv", "command", "stdin"],
+      "additionalProperties": false,
+      "properties": {
+        "argv": {"type": "array", "items": {"type": "string"}, "minItems": 2},
+        "command": {"type": "string", "minLength": 1},
+        "stdin": {
+          "type": "object",
+          "required": ["format", "source"],
+          "additionalProperties": false,
+          "properties": {
+            "format": {"const": "json"},
+            "source": {"const": "payload"}
+          }
+        }
+      }
+    },
+    "next_command": {
+      "type": ["object", "null"],
+      "required": ["argv", "command"],
+      "additionalProperties": false,
+      "properties": {
+        "argv": {"type": "array", "items": {"type": "string"}, "minItems": 2},
+        "command": {"type": "string", "minLength": 1}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "type": "object",
+        "required": ["action"],
+        "properties": {"action": {"const": "author_plan"}}
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "context": {
+            "type": "object",
+            "required": ["goal_request", "goal", "plan"]
+          },
+          "expected_output": {
+            "type": "object",
+            "properties": {
+              "payload": {
+                "type": "object",
+                "required": ["format", "required", "schema_paths"],
+                "additionalProperties": false,
+                "properties": {
+                  "format": {"const": "json"},
+                  "required": {"const": ["goal", "plan"]},
+                  "schema_paths": {
+                    "type": "object",
+                    "required": ["goal", "plan"],
+                    "additionalProperties": false,
+                    "properties": {
+                      "goal": {"type": "string", "minLength": 1},
+                      "plan": {"type": "string", "minLength": 1}
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "required": ["action"],
+        "properties": {"action": {"const": "review"}}
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "context": {
+            "type": "object",
+            "required": ["run"],
+            "properties": {
+              "run": {
+                "type": "object",
+                "required": ["run_id", "item_id", "status", "request", "result", "evidence"],
+                "additionalProperties": false,
+                "properties": {
+                  "run_id": {"type": "string", "minLength": 1},
+                  "item_id": {"type": "string", "minLength": 1},
+                  "status": {"type": "string", "enum": ["completed", "failed"]},
+                  "request": {
+                    "type": "object",
+                    "required": ["relative", "sha256", "bytes"],
+                    "additionalProperties": false,
+                    "properties": {
+                      "relative": {"type": "string", "minLength": 1},
+                      "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                      "bytes": {"type": "integer", "minimum": 0}
+                    }
+                  },
+                  "result": {
+                    "type": "object",
+                    "required": ["relative", "sha256", "bytes"],
+                    "additionalProperties": false,
+                    "properties": {
+                      "relative": {"type": "string", "minLength": 1},
+                      "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                      "bytes": {"type": "integer", "minimum": 0}
+                    }
+                  },
+                  "evidence": {
+                    "type": "object",
+                    "required": ["relative", "sha256", "bytes"],
+                    "additionalProperties": false,
+                    "properties": {
+                      "relative": {"type": "string", "minLength": 1},
+                      "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                      "bytes": {"type": "integer", "minimum": 0}
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "expected_output": {
+            "type": "object",
+            "properties": {
+              "payload": {
+                "type": "object",
+                "required": ["format", "required", "decision_values"],
+                "additionalProperties": false,
+                "properties": {
+                  "format": {"const": "json"},
+                  "required": {"const": ["decision"]},
+                  "decision_values": {
+                    "const": ["accepted", "changes_requested", "needs_human", "failed"]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
 }
