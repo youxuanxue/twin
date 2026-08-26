@@ -15,7 +15,7 @@ def main() -> int:
         emit({
             "session_id": "env-session",
             "output_text": json.dumps({
-                "DEV_RULES": os.environ.get("DEV_RULES"),
+                "HOST_ONLY": os.environ.get("HOST_ONLY"),
                 "VISIBLE": os.environ.get("VISIBLE"),
             }, sort_keys=True),
         })

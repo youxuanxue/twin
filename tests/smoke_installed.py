@@ -23,6 +23,7 @@ def main() -> int:
         env = dict(os.environ)
         env["HOME"] = str(home)
         _install_fake_git(root, env)
+        _install_fake_codex(root)
 
         _json_command(twin, env, "setup", "--json")
         contract = _json_command(twin, env, "contract", "--json")
@@ -48,9 +49,26 @@ def main() -> int:
         _require(reviewed["action"] == "review", "run did not issue a review action")
         run_id = _string(_object(_object(reviewed, "context"), "metadata"), "run_id")
 
+        run_root = home / ".twin" / "workspaces" / workspace / "runs" / run_id
+        result_payload = _json_file(run_root / "result.json")
+        _require(result_payload["returncode"] == 0, "worker runtime did not succeed")
+        _require(result_payload["output_text"] == "smoke codex completed", "worker output was unexpected")
+        evidence_payload = _json_file(run_root / "evidence.json")
+        _require(evidence_payload["status"] == "completed", "worker evidence was not completed")
+
         worktree = repo.parent / f"{repo.name}-twin-{workspace}"
         _require(worktree.is_dir(), "dirty worker worktree did not survive Twin run")
         _require((worktree / "dirty-preserve.txt").is_file(), "dirty worker file was not preserved")
+        invocation = _json_file(root / "bin" / "codex-invocation.json")
+        _require(
+            invocation["argv"][:2] == ["exec", "--json"],
+            "codex did not receive the expected protocol",
+        )
+        _require(
+            len(invocation["argv"]) == 3 and "## Twin action" in invocation["argv"][2],
+            "codex did not receive the worker prompt",
+        )
+        _require(invocation["cwd"] == str(worktree), "codex did not run in the isolated worktree")
 
         needs_human = _json_command(
             twin, env,
@@ -187,6 +205,27 @@ raise SystemExit(main())
     env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
 
 
+def _install_fake_codex(root: Path) -> None:
+    codex = root / "bin" / "codex"
+    codex.write_text(
+        """#!/opt/twin-venv/bin/python
+import json
+import sys
+from pathlib import Path
+
+
+args = sys.argv[1:]
+record = Path(__file__).with_name("codex-invocation.json")
+record.write_text(json.dumps({"argv": args, "cwd": str(Path.cwd())}), encoding="utf-8")
+if args[:2] != ["exec", "--json"] or len(args) != 3:
+    raise SystemExit(2)
+print(json.dumps({"session_id": "smoke-codex-session", "output_text": "smoke codex completed"}))
+""",
+        encoding="utf-8",
+    )
+    codex.chmod(0o755)
+
+
 def _json_command(
     twin: Path, env: dict[str, str], *args: str, cwd: Optional[Path] = None,
     input_text: Optional[str] = None,
@@ -213,6 +252,16 @@ def _command(
         [str(twin), *args], cwd=str(cwd) if cwd is not None else None, env=env,
         input=input_text, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
     )
+
+
+def _json_file(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise AssertionError(f"missing persisted run evidence: {path}") from exc
+    if not isinstance(payload, dict):
+        raise AssertionError(f"run evidence is not an object: {path}")
+    return payload
 
 
 def _object(value: dict[str, Any], key: str) -> dict[str, Any]:

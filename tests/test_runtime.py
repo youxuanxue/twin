@@ -54,19 +54,18 @@ class RuntimeAdapterTest(TestCase):
         self.root = Path(self.tempdir.name)
         self.fake_provider = Path(__file__).parent / "fixtures" / "fake_provider.py"
 
-    def test_worker_request_has_no_dev_rules_environment(self) -> None:
+    def test_worker_request_preserves_explicit_environment(self) -> None:
         request = WorkerTurnRequest(
             prompt="do work",
             cwd=Path("/tmp/repo"),
             provider="codex",
             session_id="",
             timeout_seconds=30,
-            environment={"DEV_RULES": "/tmp/dev-rules", "KEEP": "1"},
+            environment={"KEEP": "1"},
         )
-        self.assertNotIn("DEV_RULES", request.environment)
         self.assertEqual(request.environment["KEEP"], "1")
 
-    def test_local_cli_removes_dev_rules_from_process_environment(self) -> None:
+    def test_local_cli_excludes_unapproved_host_environment(self) -> None:
         runtime = LocalCliRuntime(executables={
             "codex": [sys.executable, str(self.fake_provider), "env"],
         })
@@ -76,20 +75,19 @@ class RuntimeAdapterTest(TestCase):
             provider="codex",
             session_id="session-in",
             timeout_seconds=5,
-            environment={"DEV_RULES": "/tmp/dev-rules", "VISIBLE": "yes"},
+            environment={"VISIBLE": "yes"},
         )
-        with self.subTest("host environment is scrubbed"):
-            old_dev_rules = os.environ.get("DEV_RULES")
-            os.environ["DEV_RULES"] = "/tmp/host-dev-rules"
-            try:
-                result = runtime.run_turn(request)
-            finally:
-                if old_dev_rules is None:
-                    os.environ.pop("DEV_RULES", None)
-                else:
-                    os.environ["DEV_RULES"] = old_dev_rules
+        old_host_only = os.environ.get("HOST_ONLY")
+        os.environ["HOST_ONLY"] = "do-not-forward"
+        try:
+            result = runtime.run_turn(request)
+        finally:
+            if old_host_only is None:
+                os.environ.pop("HOST_ONLY", None)
+            else:
+                os.environ["HOST_ONLY"] = old_host_only
         payload = json.loads(result.output_text)
-        self.assertEqual(payload, {"DEV_RULES": None, "VISIBLE": "yes"})
+        self.assertEqual(payload, {"HOST_ONLY": None, "VISIBLE": "yes"})
 
     def test_local_cli_reports_missing_provider_without_running_shell(self) -> None:
         result = LocalCliRuntime(executables={
@@ -391,7 +389,7 @@ class TwinServiceRuntimeIntegrationTest(TestCase):
         request_payload = json.loads((workspace / "runs" / run_id / "request.json").read_text(encoding="utf-8"))
         result_payload = json.loads((workspace / "runs" / run_id / "result.json").read_text(encoding="utf-8"))
         evidence_payload = json.loads((workspace / "runs" / run_id / "evidence.json").read_text(encoding="utf-8"))
-        self.assertNotIn("DEV_RULES", request_payload["environment"])
+        self.assertEqual(request_payload["environment"], {})
         self.assertEqual(result_payload["output_text"], "deterministic fake output")
         self.assertEqual(
             validate_document(evidence_payload, "run-evidence", self.service.resources),

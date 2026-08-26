@@ -7,7 +7,52 @@ if [[ "$wheel" != /* || ! -f "$wheel" ]]; then
   exit 2
 fi
 
+stage_parent="${TWIN_STAGE_PARENT:-${TMPDIR:-/tmp}}"
+if ! stage="$(python3 - "$stage_parent" "$HOME" <<'PY'
+import sys
+import tempfile
+from pathlib import Path
+
+stage_parent = Path(sys.argv[1]).resolve()
+home = Path(sys.argv[2]).resolve()
+try:
+    stage_parent.relative_to(home)
+except ValueError:
+    pass
+else:
+    print("TWIN_STAGE_PARENT must not be inside HOME", file=sys.stderr)
+    raise SystemExit(2)
+if not stage_parent.is_dir():
+    print("TWIN_STAGE_PARENT must be an existing directory", file=sys.stderr)
+    raise SystemExit(2)
+stage = Path(tempfile.mkdtemp(prefix="twin-smoke-", dir=stage_parent)).resolve()
+try:
+    stage.relative_to(home)
+except ValueError:
+    print(stage)
+else:
+    print("resolved stage must not be inside HOME", file=sys.stderr)
+    raise SystemExit(2)
+PY
+)"; then
+  exit 2
+fi
 runtime=""
+volume=""
+seed=""
+cleanup() {
+  if [[ -n "$seed" && -n "$runtime" ]]; then
+    "$runtime" rm -f "$seed" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$volume" && -n "$runtime" ]]; then
+    "$runtime" volume rm -f "$volume" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$stage"
+}
+trap cleanup EXIT
+cp "$wheel" "$stage/$(basename "$wheel")"
+cp tests/smoke_installed.py "$stage/smoke_installed.py"
+
 ci_requires_container=0
 case "${CI:-}" in
   ""|0|false|False) ;;
@@ -34,24 +79,19 @@ if [[ -z "$runtime" ]]; then
   exit 77
 fi
 
-stage_parent="${TWIN_STAGE_PARENT:-${TMPDIR:-/tmp}}"
-if [[ "$(uname -s)" == "Darwin" && -d "$HOME" ]]; then
-  stage_parent="${TWIN_STAGE_PARENT:-$HOME}"
-fi
-stage="$(python3 - "$stage_parent" <<'PY'
-import sys
-import tempfile
-from pathlib import Path
-
-print(Path(tempfile.mkdtemp(prefix="twin-smoke-", dir=sys.argv[1])).resolve())
-PY
-)"
-trap 'rm -rf "$stage"' EXIT
-cp "$wheel" "$stage/$(basename "$wheel")"
-cp tests/smoke_installed.py "$stage/smoke_installed.py"
+stage_id="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+volume="twin-smoke-$stage_id"
+seed="twin-smoke-stage-$stage_id"
+"$runtime" volume create "$volume" >/dev/null
+"$runtime" create --name "$seed" \
+  --mount "type=volume,src=$volume,dst=/stage" \
+  python:3.9-slim-bookworm true >/dev/null
+"$runtime" cp "$stage/." "$seed:/stage"
+"$runtime" rm "$seed" >/dev/null
+seed=""
 
 "$runtime" run --rm --network none \
-  --mount "type=bind,src=$stage,dst=/stage,readonly" \
+  --mount "type=volume,src=$volume,dst=/stage,readonly" \
   python:3.9-slim-bookworm sh -ec '
     for forbidden in \
       /Users/feng/Codes/twin \

@@ -14,7 +14,7 @@ esac
 
 runtime_surface=(README.md docs skills src/twin pyproject.toml)
 forbidden_patterns=(
-  '\$DEV_RULES'
+  'DEV_RULES'
   '/Codes/dev-rules'
   '/Codes/agent-skills'
   'scripts\.twin'
@@ -24,7 +24,7 @@ forbidden_patterns=(
   'legacy command registration'
 )
 for pattern in "${forbidden_patterns[@]}"; do
-  if rg -n --hidden -e "$pattern" "${runtime_surface[@]}"; then
+  if rg -F -n --hidden -e "$pattern" "${runtime_surface[@]}"; then
     echo "forbidden standalone-runtime reference: $pattern" >&2
     exit 1
   fi

@@ -5,7 +5,21 @@ from pathlib import Path
 from typing import Mapping, Protocol
 
 
-_BLOCKED_ENVIRONMENT_KEYS = frozenset({"DEV_RULES", "PERSONA_PATH", "TWIN_PERSONA_PATH"})
+_AMBIENT_ENVIRONMENT_ALLOWLIST = frozenset({
+    "COMSPEC",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "PATH",
+    "PATHEXT",
+    "SYSTEMROOT",
+    "TEMP",
+    "TERM",
+    "TMP",
+    "TMPDIR",
+    "WINDIR",
+})
 
 
 def clean_worker_environment(environment: Mapping[str, str] | None) -> dict[str, str]:
@@ -14,8 +28,20 @@ def clean_worker_environment(environment: Mapping[str, str] | None) -> dict[str,
     return {
         str(key): str(value)
         for key, value in environment.items()
-        if str(key) not in _BLOCKED_ENVIRONMENT_KEYS
     }
+
+
+def worker_process_environment(
+    ambient: Mapping[str, str], requested: Mapping[str, str] | None,
+) -> dict[str, str]:
+    """Propagate only portable host settings plus explicit worker settings."""
+    inherited = {
+        str(key): str(value)
+        for key, value in ambient.items()
+        if str(key) in _AMBIENT_ENVIRONMENT_ALLOWLIST
+    }
+    inherited.update(clean_worker_environment(requested))
+    return inherited
 
 
 @dataclass(frozen=True)

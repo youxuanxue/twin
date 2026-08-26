@@ -10,7 +10,7 @@ from twin.runtime.process import ProcessRunner
 from twin.runtime.protocols import (
     WorkerTurnRequest,
     WorkerTurnResult,
-    clean_worker_environment,
+    worker_process_environment,
 )
 
 
@@ -116,13 +116,7 @@ class LocalCliRuntime:
 
     @staticmethod
     def _environment(environment: Mapping[str, str]) -> dict[str, str]:
-        merged = {
-            str(key): str(value)
-            for key, value in os.environ.items()
-            if key not in {"DEV_RULES", "PERSONA_PATH", "TWIN_PERSONA_PATH"}
-        }
-        merged.update(clean_worker_environment(environment))
-        return merged
+        return worker_process_environment(os.environ, environment)
 
     @staticmethod
     def _failure(kind: str, message: str, request: WorkerTurnRequest) -> WorkerTurnResult:
