@@ -25,4 +25,3 @@ def write_bytes(path: Path, body: bytes) -> None:
 
 def write_text(path: Path, text: str) -> None:
     write_bytes(path, text.encode("utf-8"))
-

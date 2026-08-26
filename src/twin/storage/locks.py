@@ -25,4 +25,3 @@ def exclusive_lock(path: Path) -> Iterator[None]:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
         finally:
             os.close(descriptor)
-
