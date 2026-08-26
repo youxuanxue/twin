@@ -40,7 +40,7 @@ def main() -> int:
             twin, env,
             "submit-plan", "--workspace", workspace, "--supervisor", "host/codex",
             "--state-revision", str(started["state_revision"]),
-            "--action-token", _string(started, "action_token"), "--payload-file", "-", "--json",
+            _action_token_option(_string(started, "action_token")), "--payload-file", "-", "--json",
             cwd=repo, input_text=json.dumps(_plan_payload()),
         )
         reviewed = _json_command(
@@ -74,7 +74,7 @@ def main() -> int:
             twin, env,
             "submit-review", "--workspace", workspace, "--supervisor", "host/codex",
             "--state-revision", str(reviewed["state_revision"]),
-            "--action-token", _string(reviewed, "action_token"), "--run-id", run_id,
+            _action_token_option(_string(reviewed, "action_token")), "--run-id", run_id,
             "--payload-file", "-", "--json", cwd=repo,
             input_text=json.dumps({"decision": "needs_human"}),
         )
@@ -98,7 +98,7 @@ def main() -> int:
             twin, env,
             "submit-plan", "--workspace", workspace, "--supervisor", "host/codex",
             "--state-revision", str(started["state_revision"]),
-            "--action-token", _string(started, "action_token"), "--payload-file", "-", "--json",
+            _action_token_option(_string(started, "action_token")), "--payload-file", "-", "--json",
             cwd=repo, input_text=json.dumps(_plan_payload()),
         )
         _require(replay.returncode != 0, "replayed action token was accepted")
@@ -276,6 +276,10 @@ def _string(value: dict[str, Any], key: str) -> str:
     if not isinstance(child, str) or not child:
         raise AssertionError(f"missing string field: {key}")
     return child
+
+
+def _action_token_option(token: str) -> str:
+    return f"--action-token={token}"
 
 
 def _require(condition: bool, message: str) -> None:

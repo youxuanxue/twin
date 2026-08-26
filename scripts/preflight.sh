@@ -17,7 +17,7 @@ forbidden_patterns=(
   'DEV_RULES'
   '/Codes/dev-rules'
   '/Codes/agent-skills'
-  'scripts\.twin'
+  'scripts.twin'
   'scaffold'
   'bootstrap'
   'active-pointer'
