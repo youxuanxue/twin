@@ -97,12 +97,31 @@ def _parse_block_scalar(
     return "\n".join(values).rstrip("\n"), index
 
 
+def _parse_single_quoted(
+    lines: list[str], index: int, indent: int, raw_value: str
+) -> tuple[str, int]:
+    values = [raw_value[1:]]
+    while values and not values[-1].endswith("'") and index < len(lines):
+        raw = lines[index]
+        if raw.strip() and _line_indent(raw) <= indent:
+            break
+        current = _line_indent(raw)
+        values.append(raw[min(current, len(raw)):])
+        index += 1
+    text = "\n".join(values)
+    if text.endswith("'"):
+        text = text[:-1]
+    return text.replace("''", "'"), index
+
+
 def _parse_value(
     lines: list[str], index: int, indent: int, raw_value: str
 ) -> tuple[object, int]:
     value = raw_value.strip()
     if value in {"|", ">"}:
         return _parse_block_scalar(lines, index, indent, value)
+    if value.startswith("'") and not (len(value) >= 2 and value.endswith("'")):
+        return _parse_single_quoted(lines, index, indent, value)
     if value:
         return _parse_scalar(value), index
     child_index = _next_content_index(lines, index)

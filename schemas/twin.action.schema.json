@@ -6,8 +6,8 @@
   "required": ["contract_version", "action", "workspace", "supervisor_route", "state_revision", "action_token", "context", "expected_output", "submit"],
   "properties": {
     "contract_version": {"const": 1}, "action": {"type": "string", "minLength": 1}, "workspace": {"type": "string", "minLength": 1}, "supervisor_route": {"type": "string", "minLength": 1}, "state_revision": {"type": "integer", "minimum": 0}, "action_token": {"type": "string", "minLength": 1},
-    "context": {"type": "object", "maxProperties": 16, "additionalProperties": {"type": ["string", "number", "boolean", "null"]}},
-    "expected_output": {"type": "object", "maxProperties": 16, "additionalProperties": {"type": ["string", "number", "boolean", "null"]}},
+    "context": {"type": "object", "additionalProperties": false, "properties": {"metadata": {"type": "object", "maxProperties": 16, "additionalProperties": {"type": ["string", "number", "boolean", "null"]}}}},
+    "expected_output": {"type": "object", "additionalProperties": false, "properties": {"metadata": {"type": "object", "maxProperties": 16, "additionalProperties": {"type": ["string", "number", "boolean", "null"]}}}},
     "submit": {"type": "object", "additionalProperties": false, "properties": {"command": {"type": "string"}, "metadata": {"type": "object", "maxProperties": 16, "additionalProperties": {"type": ["string", "number", "boolean", "null"]}}}}
   }, "additionalProperties": false
 }

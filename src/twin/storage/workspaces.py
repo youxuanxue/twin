@@ -105,8 +105,20 @@ class WorkspaceStore:
             if value.get("workspace_id") != current.get("workspace_id"):
                 raise ValueError("state workspace_id mismatch")
             value = dict(value)
-            value["state_revision"] = expected_revision + 1
+            next_revision = expected_revision + 1
+            value["state_revision"] = next_revision
             self._write_json(workspace / "state.json", value)
+            workspace_id = value["workspace_id"]
+            if not isinstance(workspace_id, str):
+                raise ValueError("state workspace_id mismatch")
+            append_jsonl(
+                workspace / "events.jsonl",
+                event_record(
+                    workspace_id=workspace_id,
+                    state_revision=next_revision,
+                    event={"event": "state_replaced", "details": {}},
+                ),
+            )
 
     def append_event(self, workspace: Path, event: dict[str, object]) -> None:
         workspace = self._workspace_path(workspace)
