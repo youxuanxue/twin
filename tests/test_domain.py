@@ -349,6 +349,101 @@ class TwinServiceTest(TestCase):
             "host/claude",
         )
 
+    def test_journal_transaction_id_cannot_escape_transaction_root(self) -> None:
+        cases = []
+        absolute_victim = Path(self.tempdir.name) / "absolute-victim"
+        absolute_victim.mkdir()
+        cases.append((str(absolute_victim), absolute_victim))
+        action = self.service.start("ship feature", self.repo, "host/codex")
+        workspace = self.store.resolve(str(action["workspace"]), self.repo)
+        traversal_victim = workspace / "victim"
+        traversal_victim.mkdir()
+        cases.append(("../victim", traversal_victim))
+        for transaction_id, victim in cases:
+            with self.subTest(transaction_id=transaction_id):
+                (workspace / ".transaction.json").write_text(
+                    json.dumps({"schema_version": 1, "transaction_id": transaction_id, "targets": [], "created_directories": []}),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(ValueError, "invalid transaction journal"):
+                    self.store.load_state(workspace)
+                self.assertTrue(victim.is_dir())
+                self.assertTrue((workspace / ".transaction.json").is_file())
+
+    def test_malformed_or_symlinked_journal_transaction_ids_fail_closed(self) -> None:
+        action = self.service.start("ship feature", self.repo, "host/codex")
+        workspace = self.store.resolve(str(action["workspace"]), self.repo)
+        for transaction_id in ("g" * 32, "a" * 31):
+            with self.subTest(transaction_id=transaction_id):
+                (workspace / ".transaction.json").write_text(
+                    json.dumps({"schema_version": 1, "transaction_id": transaction_id, "targets": [], "created_directories": []}),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(ValueError, "invalid transaction journal"):
+                    self.store.load_state(workspace)
+                self.assertTrue((workspace / ".transaction.json").is_file())
+        transaction_id = "a" * 32
+        victim = Path(self.tempdir.name) / "symlink-victim"
+        victim.mkdir()
+        transaction_root = workspace / ".transactions"
+        transaction_root.mkdir()
+        (transaction_root / transaction_id).symlink_to(victim, target_is_directory=True)
+        (workspace / ".transaction.json").write_text(
+            json.dumps({"schema_version": 1, "transaction_id": transaction_id, "targets": [], "created_directories": []}),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "invalid transaction journal"):
+            self.store.load_state(workspace)
+        self.assertTrue(victim.is_dir())
+        self.assertTrue((workspace / ".transaction.json").is_file())
+
+    def test_artifact_writes_cannot_use_transaction_metadata_paths(self) -> None:
+        for relative in (".transaction.json", ".transactions", ".transactions/stage.bin"):
+            with self.subTest(relative=relative):
+                action = self.service.start("ship feature", self.repo, "host/codex")
+                workspace = self.store.resolve(str(action["workspace"]), self.repo)
+                with self.assertRaisesRegex(ValueError, "artifact path is reserved"):
+                    self.store.write_artifact(workspace, relative, b"blocked")
+
+    def test_rmtree_cleanup_failure_retains_journal_for_later_recovery(self) -> None:
+        action = self.service.start("ship feature", self.repo, "host/codex")
+        workspace = self.store.resolve(str(action["workspace"]), self.repo)
+        before = {name: (workspace / name).read_bytes() for name in ("goal.yaml", "plan.yaml", "state.json", "events.jsonl")}
+        with patch("twin.storage.workspaces.shutil.rmtree", return_value=None):
+            with self.assertRaisesRegex(OSError, "transaction staging cleanup"):
+                self.service.submit_plan(
+                    action["workspace"], "host/codex", action["state_revision"], action["action_token"], valid_goal_and_plan()
+                )
+        self.assertTrue((workspace / ".transaction.json").is_file())
+        self.assertTrue((workspace / ".transactions").is_dir())
+        self.assertEqual(self.store.load_state(workspace)["state_revision"], 1)
+        self.assertEqual({name: (workspace / name).read_bytes() for name in before}, before)
+        self.assertFalse((workspace / ".transaction.json").exists())
+        self.assertFalse((workspace / ".transactions").exists())
+
+    def test_created_directory_cleanup_failure_retains_journal_for_retry(self) -> None:
+        human = self._needs_human_workspace()
+        workspace = self.store.resolve(str(human["workspace"]), self.repo)
+        digest = hashlib.sha256(b"sensitive approval").hexdigest()
+        created = workspace / "artifacts" / "human"
+        original_rmdir = Path.rmdir
+
+        def fail_created_directory(path: Path) -> None:
+            if path.resolve() == created.resolve():
+                raise OSError("created directory blocked")
+            original_rmdir(path)
+
+        with patch.object(self.store, "_publish_staged", side_effect=OSError("publish blocked")):
+            with patch.object(Path, "rmdir", new=fail_created_directory):
+                with self.assertRaisesRegex(OSError, "created directory blocked"):
+                    self.service.respond(human["workspace"], self.repo, "sensitive approval")
+        self.assertTrue((workspace / ".transaction.json").is_file())
+        self.assertTrue(created.is_dir())
+        self.assertEqual(self.store.load_state(workspace)["status"], "needs_human")
+        self.assertFalse((workspace / ".transaction.json").exists())
+        self.assertFalse(created.exists())
+        self.assertFalse((workspace / "artifacts" / "human" / f"{digest}.txt").exists())
+
     def test_terminal_workspace_cannot_mutate(self) -> None:
         action = self.service.start("ship feature", self.repo, "host/codex")
         workspace = self.store.resolve(str(action["workspace"]), self.repo)

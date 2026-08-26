@@ -19,6 +19,9 @@ from twin.storage.locks import exclusive_lock
 from twin.yaml_codec import dump_yaml
 
 
+_TRANSACTION_ID = re.compile(r"[0-9a-f]{32}")
+
+
 class WorkspaceStore:
     def __init__(self, paths: TwinPaths) -> None:
         self.paths = paths
@@ -284,6 +287,7 @@ class WorkspaceStore:
                 or not isinstance(created, list)
             ):
                 raise ValueError("invalid transaction journal")
+            self._transaction_dir(workspace, transaction_id)
             snapshots: list[tuple[Path, bytes | None]] = []
             for entry in targets:
                 if not isinstance(entry, dict):
@@ -309,11 +313,7 @@ class WorkspaceStore:
                 target.unlink(missing_ok=True)
             else:
                 write_bytes(target, body)
-        for directory in reversed(created_directories):
-            try:
-                directory.rmdir()
-            except OSError:
-                pass
+        self._cleanup_created_directories(created_directories)
         self._cleanup_transaction_dir(workspace, transaction_id)
         journal.unlink(missing_ok=True)
 
@@ -323,10 +323,10 @@ class WorkspaceStore:
             raise ValueError("invalid transaction journal")
         target = (workspace / candidate).resolve()
         try:
-            target.relative_to(workspace)
+            rendered = target.relative_to(workspace)
         except ValueError as exc:
             raise ValueError("invalid transaction journal") from exc
-        if target == workspace / ".transaction.json":
+        if rendered.parts and rendered.parts[0] in {".transaction.json", ".transactions"}:
             raise ValueError("invalid transaction journal")
         return target
 
@@ -337,6 +337,33 @@ class WorkspaceStore:
         }:
             raise ValueError("invalid transaction journal")
         return directory
+
+    @staticmethod
+    def _cleanup_created_directories(created_directories: list[Path]) -> None:
+        for directory in reversed(created_directories):
+            if directory.exists():
+                directory.rmdir()
+            if directory.exists() or directory.is_symlink():
+                raise OSError(f"transaction-created directory cleanup incomplete: {directory}")
+
+    @staticmethod
+    def _transaction_dir(workspace: Path, transaction_id: str) -> tuple[Path, Path]:
+        if _TRANSACTION_ID.fullmatch(transaction_id) is None:
+            raise ValueError("invalid transaction journal")
+        workspace_root = workspace.resolve()
+        root = workspace / ".transactions"
+        if root.is_symlink():
+            raise ValueError("invalid transaction journal")
+        resolved_root = root.resolve()
+        if resolved_root != workspace_root / ".transactions":
+            raise ValueError("invalid transaction journal")
+        transaction = root / transaction_id
+        if transaction.is_symlink():
+            raise ValueError("invalid transaction journal")
+        resolved_transaction = transaction.resolve()
+        if resolved_transaction.parent != resolved_root:
+            raise ValueError("invalid transaction journal")
+        return transaction, root
 
     @staticmethod
     def _missing_parent_dirs(workspace: Path, targets: dict[Path, bytes]) -> list[Path]:
@@ -350,12 +377,15 @@ class WorkspaceStore:
 
     @staticmethod
     def _cleanup_transaction_dir(workspace: Path, transaction_id: str) -> None:
-        root = workspace / ".transactions"
-        shutil.rmtree(root / transaction_id, ignore_errors=True)
-        try:
+        transaction, root = WorkspaceStore._transaction_dir(workspace, transaction_id)
+        if transaction.exists():
+            shutil.rmtree(transaction)
+        if transaction.exists() or transaction.is_symlink():
+            raise OSError(f"transaction staging cleanup incomplete: {transaction}")
+        if root.exists():
             root.rmdir()
-        except OSError:
-            pass
+        if root.exists() or root.is_symlink():
+            raise OSError(f"transaction staging cleanup incomplete: {root}")
 
     def _new_workspace_id(self, request: str) -> str:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -388,9 +418,11 @@ class WorkspaceStore:
             raise ValueError("artifact path must be relative")
         target = (workspace / candidate).resolve()
         try:
-            target.relative_to(workspace)
+            rendered = target.relative_to(workspace)
         except ValueError as exc:
             raise ValueError("artifact path escapes workspace") from exc
+        if rendered.parts and rendered.parts[0] in {".transaction.json", ".transactions"}:
+            raise ValueError("artifact path is reserved")
         if target == workspace or target.name in {
             "meta.json", "goal.yaml", "plan.yaml", "state.json", "events.jsonl"
         }:
