@@ -64,6 +64,10 @@ def transaction_stage_name(transaction_id: str, index: int) -> str:
     return f".twin-txn-{transaction_id}-{index}.stage"
 
 
+def transaction_journal_stage_name(transaction_id: str) -> str:
+    return f".twin-txn-{transaction_id}-journal.stage"
+
+
 class TwinServiceTest(TestCase):
     def setUp(self) -> None:
         self.tempdir = TemporaryDirectory()
@@ -597,6 +601,110 @@ class TwinServiceTest(TestCase):
         foreign_stage.unlink()
         self.assertEqual(self.store.load_state(workspace)["state_revision"], action["state_revision"])
         self.assertFalse((workspace / ".transaction.json").exists())
+        self.assertEqual(
+            self.service.submit_plan(
+                action["workspace"], "host/codex", action["state_revision"],
+                action["action_token"], valid_goal_and_plan(),
+            )["status"],
+            "ready",
+        )
+
+    def test_journal_link_failure_removes_owned_journal_stage_and_retry_succeeds(self) -> None:
+        action = self.service.start("ship feature", self.repo, "host/codex")
+        workspace = self.store.resolve(str(action["workspace"]), self.repo)
+        transaction_id = "c" * 32
+
+        def fail_journal_link(*args: object, **kwargs: object) -> None:
+            raise OSError("journal link failure")
+
+        with patch("twin.storage.workspaces.secrets.token_hex", return_value=transaction_id):
+            with patch("twin.storage.workspaces.os.link", side_effect=fail_journal_link):
+                with self.assertRaisesRegex(OSError, "journal link failure"):
+                    self.service.submit_plan(
+                        action["workspace"], "host/codex", action["state_revision"],
+                        action["action_token"], valid_goal_and_plan(),
+                    )
+
+        retry_failure: BaseException | None = None
+        try:
+            retry = self.service.submit_plan(
+                action["workspace"], "host/codex", action["state_revision"],
+                action["action_token"], valid_goal_and_plan(),
+            )
+        except BaseException as exc:
+            retry_failure = exc
+            retry = None
+        owned_stages = sorted(
+            entry.name for entry in workspace.iterdir()
+            if entry.name == transaction_journal_stage_name(transaction_id)
+        )
+        self.assertEqual(
+            owned_stages, [],
+            f"retry failed with {retry_failure!r}; leaked journal stages: {owned_stages}",
+        )
+        if retry_failure is not None:
+            raise retry_failure
+        assert retry is not None
+        self.assertEqual(retry["status"], "ready")
+
+    def test_foreign_journal_race_preserves_foreign_entries_and_removes_owned_stages(self) -> None:
+        action = self.service.start("ship feature", self.repo, "host/codex")
+        workspace = self.store.resolve(str(action["workspace"]), self.repo)
+        transaction_id = "d" * 32
+        foreign_stage = workspace / transaction_stage_name("f" * 32, 99)
+        foreign_stage_body = b"foreign stage"
+        foreign_journal_body = b"foreign journal"
+
+        def race_foreign_journal(
+            src: object,
+            dst: object,
+            *,
+            src_dir_fd: int | None = None,
+            dst_dir_fd: int | None = None,
+            follow_symlinks: bool = True,
+        ) -> None:
+            del src, follow_symlinks
+            self.assertEqual(dst, ".transaction.json")
+            assert dst_dir_fd is not None
+            descriptor = os.open(
+                ".transaction.json",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=dst_dir_fd,
+            )
+            try:
+                os.write(descriptor, foreign_journal_body)
+            finally:
+                os.close(descriptor)
+            stage_descriptor = os.open(
+                foreign_stage.name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=dst_dir_fd,
+            )
+            try:
+                os.write(stage_descriptor, foreign_stage_body)
+            finally:
+                os.close(stage_descriptor)
+            raise FileExistsError("foreign journal raced")
+
+        with patch("twin.storage.workspaces.secrets.token_hex", return_value=transaction_id):
+            with patch("twin.storage.workspaces.os.link", side_effect=race_foreign_journal):
+                with self.assertRaises(ValueError):
+                    self.service.submit_plan(
+                        action["workspace"], "host/codex", action["state_revision"],
+                        action["action_token"], valid_goal_and_plan(),
+                    )
+
+        self.assertEqual((workspace / ".transaction.json").read_bytes(), foreign_journal_body)
+        self.assertEqual(foreign_stage.read_bytes(), foreign_stage_body)
+        owned_stages = sorted(
+            entry.name for entry in workspace.iterdir()
+            if entry.name.startswith(f".twin-txn-{transaction_id}-")
+        )
+        self.assertEqual(owned_stages, [])
+        (workspace / ".transaction.json").unlink()
+        foreign_stage.unlink()
         self.assertEqual(
             self.service.submit_plan(
                 action["workspace"], "host/codex", action["state_revision"],

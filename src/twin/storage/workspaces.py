@@ -263,6 +263,10 @@ class WorkspaceStore:
                 staged[target] = self._stage_bytes(
                     workspace_fd, self._stage_name(transaction_id, index), body
                 )
+            def mark_journal_created() -> None:
+                nonlocal journal_created
+                journal_created = True
+
             journal_identity = self._write_transaction_journal(
                 workspace_fd,
                 transaction_id,
@@ -274,13 +278,13 @@ class WorkspaceStore:
                     created_directories,
                     list(staged.values()),
                 ),
+                mark_journal_created=mark_journal_created,
             )
-            journal_created = True
             self._publish_staged(
                 staged, previous, workspace / "state.json", workspace_fd
             )
         except BaseException:
-            if journal_created or self._entry_exists(workspace_fd, _TRANSACTION_JOURNAL):
+            if journal_created:
                 self._recover_locked(workspace, workspace_fd)
             else:
                 self._cleanup_staged_files(workspace_fd, list(staged.values()))
@@ -562,24 +566,36 @@ class WorkspaceStore:
         os.unlink(name, dir_fd=workspace_fd)
 
     def _write_transaction_journal(
-        self, workspace_fd: int, transaction_id: str, value: dict[str, object]
+        self,
+        workspace_fd: int,
+        transaction_id: str,
+        value: dict[str, object],
+        *,
+        mark_journal_created: Callable[[], None] | None = None,
     ) -> tuple[int, int]:
         temporary = self._stage_bytes(
             workspace_fd,
             self._journal_stage_name(transaction_id),
             self._json_bytes(value),
         )
+        journal_created = False
         try:
             if self._entry_exists(workspace_fd, _TRANSACTION_JOURNAL):
                 raise ValueError("invalid transaction journal")
             self._assert_stage_entry(workspace_fd, temporary)
-            os.link(
-                temporary.name,
-                _TRANSACTION_JOURNAL,
-                src_dir_fd=workspace_fd,
-                dst_dir_fd=workspace_fd,
-                follow_symlinks=False,
-            )
+            try:
+                os.link(
+                    temporary.name,
+                    _TRANSACTION_JOURNAL,
+                    src_dir_fd=workspace_fd,
+                    dst_dir_fd=workspace_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as exc:
+                raise ValueError("invalid transaction journal") from exc
+            journal_created = True
+            if mark_journal_created is not None:
+                mark_journal_created()
             journal = os.stat(
                 _TRANSACTION_JOURNAL,
                 dir_fd=workspace_fd,
@@ -592,6 +608,15 @@ class WorkspaceStore:
             )
             os.fsync(workspace_fd)
             return temporary.identity
+        except BaseException:
+            if (
+                not journal_created
+                and self._entry_exists(workspace_fd, temporary.name)
+            ):
+                self._unlink_matching_entry(
+                    workspace_fd, temporary.name, temporary.identity
+                )
+            raise
         finally:
             temporary.close()
 
