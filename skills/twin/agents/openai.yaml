@@ -1,0 +1,6 @@
+interface:
+  display_name: "Twin"
+  short_description: "Run the installed Twin supervisor"
+  default_prompt: "Use $twin to supervise this goal."
+policy:
+  allow_implicit_invocation: false

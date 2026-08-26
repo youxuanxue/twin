@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xuejiao-twin"
+version = "0.1.0"
+description = "Provider-neutral supervisor for evidence-driven agent work"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+twin = "twin.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.data-files]
+"share/twin/schemas" = ["schemas/*.json"]
+"share/twin/personas" = ["personas/*.md"]
+"share/twin/skills/twin" = ["skills/twin/SKILL.md"]
+"share/twin/skills/twin/agents" = ["skills/twin/agents/*.yaml"]
+"share/twin/templates/workspace" = ["templates/workspace/*.yaml"]

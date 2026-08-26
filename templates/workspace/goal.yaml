@@ -1,0 +1,7 @@
+schema_version: 1
+id: replace-with-goal-id
+one_liner: Replace with one verifiable outcome
+core_goal: |
+  Replace with the user or business result, not implementation steps.
+acceptance_criteria: []
+non_goals: []

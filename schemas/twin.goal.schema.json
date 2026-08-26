@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/youxuanxue/twin/schemas/twin.goal.schema.json",
+  "title": "Twin goal",
+  "type": "object",
+  "required": ["schema_version", "id", "one_liner", "core_goal", "acceptance_criteria", "non_goals"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "id": {"type": "string", "minLength": 1},
+    "one_liner": {"type": "string", "minLength": 1},
+    "core_goal": {"type": "string", "minLength": 1},
+    "acceptance_criteria": {"type": "array"},
+    "non_goals": {"type": "array"}
+  },
+  "additionalProperties": false
+}
