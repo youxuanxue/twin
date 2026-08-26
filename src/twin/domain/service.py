@@ -30,12 +30,13 @@ class TwinService:
         isolation: WorkspaceIsolation | None = None,
         *,
         timeout_seconds: float = 300,
+        resources: ResourceCatalog | None = None,
     ) -> None:
         self.store = store
         self.runtime = runtime
         self.isolation = isolation
         self.timeout_seconds = timeout_seconds
-        self.resources = ResourceCatalog(Path(__file__).resolve().parents[3])
+        self.resources = resources or ResourceCatalog()
 
     def start(self, goal: str, repo_root: Path, route: str) -> dict[str, object]:
         workspace_id = self.store.create(goal, repo_root, route)

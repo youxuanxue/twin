@@ -29,11 +29,14 @@ class DoctorReportTest(TestCase):
                 report = doctor_report(paths, resources)
 
         expected_checks = {
-            "package_resources", "state_home", "cursor_skill", "claude_skill", "codex_skill",
-            "antigravity_skill", "git", "claude", "codex", "gemini", "cao_configuration",
+            "python", "package_resources", "state_home", "cursor_skill", "claude_skill",
+            "codex_skill", "antigravity_skill", "git", "claude", "codex", "gemini",
+            "cao_configuration",
         }
         self.assertEqual(set(report["checks"]), expected_checks)
         self.assertTrue(report["ok"])
+        self.assertTrue(report["checks"]["python"]["ok"])
+        self.assertIn("Python", report["checks"]["python"]["detail"])
         self.assertFalse(report["checks"]["claude"]["ok"])
         self.assertFalse(report["checks"]["codex"]["ok"])
         self.assertFalse(report["checks"]["gemini"]["ok"])

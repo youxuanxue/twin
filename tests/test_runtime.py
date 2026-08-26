@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from twin.domain.service import TwinService
 from twin.paths import TwinPaths
+from twin.resources import ResourceCatalog
 from twin.runtime.cao import CaoRuntime
 from twin.runtime.local_cli import LocalCliRuntime
 from twin.runtime.process import ProcessResult, ProcessRunner
@@ -366,7 +367,10 @@ class TwinServiceRuntimeIntegrationTest(TestCase):
         self.store = WorkspaceStore(TwinPaths.for_home(root / "home"))
         self.runtime = _DeterministicRuntime()
         self.isolation = _DeterministicIsolation()
-        self.service = TwinService(self.store, runtime=self.runtime, isolation=self.isolation)
+        self.resources = ResourceCatalog(Path(__file__).resolve().parents[1])
+        self.service = TwinService(
+            self.store, runtime=self.runtime, isolation=self.isolation, resources=self.resources
+        )
 
     def test_run_persists_runtime_evidence_and_transitions_to_review_required(self) -> None:
         start = self.service.start("ship feature", self.repo, "host/codex")
@@ -402,6 +406,7 @@ class TwinServiceRuntimeIntegrationTest(TestCase):
             self.store,
             runtime=self.runtime,
             isolation=_FailingIsolation(),
+            resources=self.resources,
         )
         start = service.start("ship feature", self.repo, "host/codex")
         ready = service.submit_plan(

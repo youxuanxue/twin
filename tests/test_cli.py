@@ -1,4 +1,6 @@
 import json
+import shutil
+from contextlib import redirect_stderr
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -7,8 +9,10 @@ from unittest.mock import patch
 
 from twin.cli import build_parser, main, parser_help
 from twin.contract import render_contract
+from twin.domain.service import TwinService
 from twin.paths import TwinPaths
 from twin.resources import ResourceCatalog
+from twin.storage.workspaces import WorkspaceStore
 
 
 class CliSurfaceTest(TestCase):
@@ -47,6 +51,83 @@ class CliSurfaceTest(TestCase):
             commands["start"]["output"],
             {"shape": "action", "schema_path": str(self.resources.schema("action"))},
         )
+
+    def test_contract_describes_each_submission_result_shape(self) -> None:
+        commands = render_contract(build_parser(), self.resources)["commands"]
+        self.assertEqual(
+            {name: commands[name]["output"] for name in (
+                "submit-plan", "submit-instruction", "submit-review",
+            )},
+            {
+                "submit-plan": {"shape": "workspace-result"},
+                "submit-instruction": {
+                    "shape": "action",
+                    "schema_path": str(self.resources.schema("action")),
+                },
+                "submit-review": {"shape": "workspace-result"},
+            },
+        )
+
+    def test_mandatory_json_commands_reject_missing_json_flag(self) -> None:
+        parser = build_parser()
+        cases = (
+            ["start", "ship", "--supervisor", "host/codex"],
+            ["run", "--supervisor", "host/codex"],
+            ["handoff", "workspace", "--from", "host/codex", "--to", "host/claude"],
+            ["contract"],
+        )
+        for argv in cases:
+            with self.subTest(argv=argv):
+                with redirect_stderr(StringIO()):
+                    with self.assertRaises(SystemExit) as failure:
+                        parser.parse_args(argv)
+                self.assertEqual(failure.exception.code, 2)
+
+    def test_optional_doctor_without_json_uses_text_renderer(self) -> None:
+        with TemporaryDirectory() as raw:
+            output = StringIO()
+            with patch("twin.cli._paths_for_home", return_value=TwinPaths.for_home(Path(raw) / "home")):
+                with patch("sys.stdout", output):
+                    self.assertEqual(main(["doctor"]), 0)
+        self.assertTrue(output.getvalue().startswith("checks:"))
+
+    def test_submit_plan_validates_against_an_injected_installed_resource_root(self) -> None:
+        with TemporaryDirectory() as raw:
+            root = Path(raw)
+            installed_root = root / "installed" / "share" / "twin"
+            source_root = Path(__file__).resolve().parents[1]
+            for name in ("schemas", "personas", "templates"):
+                shutil.copytree(source_root / name, installed_root / name)
+            shutil.copytree(source_root / "skills", installed_root / "skills")
+            repo = root / "repo"
+            repo.mkdir()
+            service = TwinService(
+                WorkspaceStore(TwinPaths.for_home(root / "home")),
+                resources=ResourceCatalog(installed_root),
+            )
+
+            action = service.start("ship", repo, "host/codex")
+            result = service.submit_plan(
+                action["workspace"], "host/codex", action["state_revision"], action["action_token"],
+                {
+                    "goal": {
+                        "schema_version": 1,
+                        "id": "assigned-by-service",
+                        "one_liner": "Ship",
+                        "core_goal": "Ship safely",
+                        "acceptance_criteria": [],
+                        "non_goals": [],
+                    },
+                    "plan": {
+                        "schema_version": 1,
+                        "goal_id": "assigned-by-service",
+                        "items": [],
+                        "verification": [],
+                    },
+                },
+            )
+
+        self.assertEqual(result["status"], "ready")
 
     def test_contract_command_emits_json_without_provider_dependency(self) -> None:
         output = StringIO()

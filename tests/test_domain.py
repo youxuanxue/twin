@@ -11,6 +11,7 @@ from unittest import TestCase
 
 from twin.domain.service import TwinService
 from twin.paths import TwinPaths
+from twin.resources import ResourceCatalog
 from twin.storage.workspaces import WorkspaceStore
 
 
@@ -76,7 +77,9 @@ class TwinServiceTest(TestCase):
         self.repo = root / "repo"
         self.repo.mkdir()
         self.store = WorkspaceStore(TwinPaths.for_home(root / "home"))
-        self.service = TwinService(self.store)
+        self.service = TwinService(
+            self.store, resources=ResourceCatalog(Path(__file__).resolve().parents[1])
+        )
 
     def start_and_submit_plan(self) -> dict[str, object]:
         action = self.service.start("ship feature", self.repo, "host/codex")
@@ -293,13 +296,14 @@ class TwinServiceTest(TestCase):
             from pathlib import Path
             from twin.domain.service import TwinService
             from twin.paths import TwinPaths
+            from twin.resources import ResourceCatalog
             from twin.storage.workspaces import WorkspaceStore
 
             root = Path(sys.argv[1])
             action = json.loads(sys.argv[2])
             payload = json.loads(sys.argv[3])
             store = WorkspaceStore(TwinPaths.for_home(root / "home"))
-            service = TwinService(store)
+            service = TwinService(store, resources=ResourceCatalog(Path(sys.argv[4])))
 
             def crash_after_first_publish(staged, previous, state_path, transaction_fd):
                 target = next(target for target in staged if target != state_path)
@@ -312,7 +316,10 @@ class TwinServiceTest(TestCase):
             )
         """)
         result = subprocess.run(
-            [sys.executable, "-c", script, str(root), json.dumps(action), json.dumps(valid_goal_and_plan())],
+            [
+                sys.executable, "-c", script, str(root), json.dumps(action),
+                json.dumps(valid_goal_and_plan()), str(Path(__file__).resolve().parents[1]),
+            ],
             env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")},
             check=False,
         )

@@ -12,6 +12,7 @@ from twin.resources import ResourceCatalog
 def doctor_report(paths: TwinPaths, resources: ResourceCatalog) -> dict[str, object]:
     """Return installation health without treating provider availability as fatal."""
     checks = {
+        "python": _python_check(),
         "package_resources": _package_resources_check(resources),
         "state_home": _state_home_check(paths),
         "cursor_skill": _skill_link_check(paths, ".cursor/skills/twin", resources),
@@ -27,12 +28,20 @@ def doctor_report(paths: TwinPaths, resources: ResourceCatalog) -> dict[str, obj
         "cao_configuration": _cao_configuration_check(paths),
     }
     required = (
-        "package_resources", "state_home", "cursor_skill", "claude_skill",
+        "python", "package_resources", "state_home", "cursor_skill", "claude_skill",
         "codex_skill", "antigravity_skill", "git",
     )
     return {
-        "ok": sys.version_info >= (3, 9) and all(checks[name]["ok"] for name in required),
+        "ok": all(checks[name]["ok"] for name in required),
         "checks": checks,
+    }
+
+
+def _python_check() -> dict[str, object]:
+    version = sys.version_info
+    return {
+        "ok": version >= (3, 9),
+        "detail": f"Python {version.major}.{version.minor}.{version.micro}",
     }
 
 

@@ -70,7 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     start.add_argument("goal")
     start.add_argument("--supervisor", required=True)
-    _add_json_flag(start)
+    _add_json_flag(start, required=True)
 
     run = add_command(
         "run", visibility="public",
@@ -80,7 +80,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("workspace", nargs="?")
     run.add_argument("--supervisor", required=True)
-    _add_json_flag(run)
+    _add_json_flag(run, required=True)
 
     status = add_command(
         "status", visibility="public",
@@ -110,7 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
     handoff.add_argument("workspace")
     handoff.add_argument("--from", dest="from_route", required=True)
     handoff.add_argument("--to", dest="to_route", required=True)
-    _add_json_flag(handoff)
+    _add_json_flag(handoff, required=True)
 
     doctor = add_command(
         "doctor", visibility="administrative", argv=["doctor", "[--json]"],
@@ -122,13 +122,14 @@ def build_parser() -> argparse.ArgumentParser:
         "contract", visibility="administrative", argv=["contract", "--json"],
         output={"shape": "contract"}, help_text="emit machine-readable command discovery",
     )
-    _add_json_flag(contract)
+    _add_json_flag(contract, required=True)
 
     _add_submission_command(
         add_command, "submit-plan",
         ["submit-plan", "--workspace", "<id>", "--supervisor", "host/<provider>",
          "--state-revision", "<int>", "--action-token", "<token>", "--payload-file", "-", "--json"],
         "submit a plan for a pending author action",
+        output={"shape": "workspace-result"},
     )
     _add_submission_command(
         add_command, "submit-instruction",
@@ -136,6 +137,7 @@ def build_parser() -> argparse.ArgumentParser:
          "--state-revision", "<int>", "--action-token", "<token>", "--run-id", "<id>",
          "--payload-file", "-", "--json"],
         "submit a worker instruction result",
+        output={"shape": "action", "schema_path": action_schema},
         needs_run_id=True,
     )
     _add_submission_command(
@@ -144,6 +146,7 @@ def build_parser() -> argparse.ArgumentParser:
          "--state-revision", "<int>", "--action-token", "<token>", "--run-id", "<id>",
          "--payload-file", "-", "--json"],
         "submit a review decision",
+        output={"shape": "workspace-result"},
         needs_run_id=True,
     )
     return parser
@@ -163,7 +166,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    _emit(result)
+    _emit(result, as_json=args.json)
     return 0
 
 
@@ -175,7 +178,7 @@ def _dispatch(
         return render_contract(build_parser(), resources)
     if command == "doctor":
         return doctor_report(paths, resources)
-    service = _service(paths)
+    service = _service(paths, resources)
     repo_root = Path.cwd()
     if command == "start":
         return service.start(args.goal, repo_root, args.supervisor)
@@ -203,9 +206,10 @@ def _dispatch(
     raise ValueError(f"unknown command: {command}")
 
 
-def _service(paths: TwinPaths) -> TwinService:
+def _service(paths: TwinPaths, resources: ResourceCatalog) -> TwinService:
     return TwinService(
-        WorkspaceStore(paths), runtime=LocalCliRuntime(), isolation=GitWorkspaceIsolation()
+        WorkspaceStore(paths), runtime=LocalCliRuntime(), isolation=GitWorkspaceIsolation(),
+        resources=resources,
     )
 
 
@@ -223,8 +227,8 @@ def _resource_catalog() -> ResourceCatalog:
     return installed
 
 
-def _add_json_flag(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--json", action="store_true")
+def _add_json_flag(parser: argparse.ArgumentParser, *, required: bool = False) -> None:
+    parser.add_argument("--json", action="store_true", required=required)
 
 
 def _add_submission_command(
@@ -233,10 +237,11 @@ def _add_submission_command(
     argv: list[str],
     help_text: str,
     *,
+    output: dict[str, str],
     needs_run_id: bool = False,
 ) -> None:
     command = add_command(
-        name, visibility="action-only", argv=argv, output={"shape": "workspace-result"},
+        name, visibility="action-only", argv=argv, output=output,
         help_text=help_text,
     )
     command.add_argument("--workspace", required=True)
@@ -246,7 +251,7 @@ def _add_submission_command(
     if needs_run_id:
         command.add_argument("--run-id", required=True)
     command.add_argument("--payload-file", type=_stdin_payload, required=True)
-    _add_json_flag(command)
+    _add_json_flag(command, required=True)
 
 
 def _stdin_payload(value: str) -> str:
@@ -262,5 +267,11 @@ def _read_payload(_: str) -> dict[str, object]:
     return payload
 
 
-def _emit(result: dict[str, object]) -> None:
-    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+def _emit(result: dict[str, object], *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return
+    for key in sorted(result):
+        value = result[key]
+        rendered = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        print(f"{key}: {rendered}")
