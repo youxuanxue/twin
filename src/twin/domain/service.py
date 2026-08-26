@@ -141,10 +141,21 @@ class TwinService:
             raise ValueError("workspace is not awaiting human response")
         body = answer.encode("utf-8")
         digest = hashlib.sha256(body).hexdigest()
-        artifact = self.store.write_artifact(workspace, f"artifacts/human/{digest}.txt", body)
-        self.store.append_event(workspace, {"event": "human_response", "details": {"artifact": artifact["relative"], "length": len(body), "sha256": digest}})
+        artifact: dict[str, object] = {
+            "relative": f"artifacts/human/{digest}.txt",
+            "sha256": digest,
+            "bytes": len(body),
+        }
         transition(state, "ready")
-        self.store.replace_state(workspace, self._revision(state), state)
+        self.store.commit_action(
+            workspace, self._revision(state), state,
+            documents={}, artifacts={str(artifact["relative"]): body},
+            event={
+                "event": "human_response",
+                "details": {"artifact": artifact["relative"], "length": len(body), "sha256": digest},
+            },
+            validate_current=self._validate_current_human_response,
+        )
         result = self._result(workspace, self._state(workspace))
         result["artifact"] = artifact
         return result
@@ -158,8 +169,12 @@ class TwinService:
         if state.get("supervisor_route") != from_route:
             raise ValueError("supervisor route mismatch")
         state["supervisor_route"] = to_route
-        self.store.replace_state(workspace, self._revision(state), state)
-        self.store.append_event(workspace, {"event": "handoff", "details": {"from_route": from_route, "to_route": to_route}})
+        self.store.commit_action(
+            workspace, self._revision(state), state,
+            documents={}, artifacts={},
+            event={"event": "handoff", "details": {"from_route": from_route, "to_route": to_route}},
+            validate_current=lambda current: self._validate_current_handoff(current, from_route),
+        )
         return self._result(workspace, self._state(workspace))
 
     def status(self, workspace_ref: str | None, repo_root: Path) -> dict[str, object]:
@@ -208,6 +223,20 @@ class TwinService:
         validate_submission(
             state, kind=kind, route=route, revision=revision, token=token, run_id=run_id
         )
+
+    @staticmethod
+    def _validate_current_human_response(state: dict[str, object]) -> None:
+        require_mutable(state)
+        if state.get("status") != "needs_human":
+            raise ValueError("workspace is not awaiting human response")
+
+    @staticmethod
+    def _validate_current_handoff(state: dict[str, object], from_route: str) -> None:
+        require_mutable(state)
+        if state.get("pending_action") is not None:
+            raise ValueError("pending action")
+        if state.get("supervisor_route") != from_route:
+            raise ValueError("supervisor route mismatch")
 
     @staticmethod
     def _revision(state: dict[str, object]) -> int:

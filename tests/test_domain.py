@@ -1,7 +1,11 @@
 import hashlib
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 from tempfile import TemporaryDirectory
+import textwrap
 from unittest.mock import patch
 from unittest import TestCase
 
@@ -246,6 +250,105 @@ class TwinServiceTest(TestCase):
         self.assertIn("Winner plan", (workspace / "goal.yaml").read_text(encoding="utf-8"))
         self.assertNotIn("Loser plan", (workspace / "goal.yaml").read_text(encoding="utf-8"))
 
+    def test_recovery_restores_old_workspace_after_child_dies_mid_publication(self) -> None:
+        action = self.service.start("ship feature", self.repo, "host/codex")
+        workspace = self.store.resolve(str(action["workspace"]), self.repo)
+        before = {
+            relative: (workspace / relative).read_bytes()
+            for relative in ("goal.yaml", "plan.yaml", "state.json", "events.jsonl")
+        }
+        root = Path(self.tempdir.name)
+        script = textwrap.dedent("""
+            import json
+            import os
+            import sys
+            from pathlib import Path
+            from twin.domain.service import TwinService
+            from twin.paths import TwinPaths
+            from twin.storage.workspaces import WorkspaceStore
+
+            root = Path(sys.argv[1])
+            action = json.loads(sys.argv[2])
+            payload = json.loads(sys.argv[3])
+            store = WorkspaceStore(TwinPaths.for_home(root / "home"))
+            service = TwinService(store)
+
+            def crash_after_first_publish(staged, previous, state_path):
+                target = next(target for target in staged if target != state_path)
+                os.replace(staged[target], target)
+                os._exit(79)
+
+            store._publish_staged = crash_after_first_publish
+            service.submit_plan(
+                action["workspace"], "host/codex", action["state_revision"], action["action_token"], payload
+            )
+        """)
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(root), json.dumps(action), json.dumps(valid_goal_and_plan())],
+            env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")},
+            check=False,
+        )
+        self.assertEqual(result.returncode, 79)
+        self.assertEqual(self.store.load_state(workspace)["state_revision"], 1)
+        self.assertEqual({relative: (workspace / relative).read_bytes() for relative in before}, before)
+        self.assertEqual(
+            self.service.submit_plan(
+                action["workspace"], "host/codex", action["state_revision"], action["action_token"], valid_goal_and_plan()
+            )["status"],
+            "ready",
+        )
+
+    def test_staging_second_file_failure_leaves_no_transaction_temps(self) -> None:
+        action = self.service.start("ship feature", self.repo, "host/codex")
+        workspace = self.store.resolve(str(action["workspace"]), self.repo)
+        original_stage = self.store._stage_bytes
+        calls = 0
+
+        def fail_second_stage(target: Path, body: bytes) -> Path:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("second staging failure")
+            return original_stage(target, body)
+
+        with patch.object(self.store, "_stage_bytes", side_effect=fail_second_stage):
+            with self.assertRaisesRegex(OSError, "second staging failure"):
+                self.service.submit_plan(
+                    action["workspace"], "host/codex", action["state_revision"], action["action_token"], valid_goal_and_plan()
+                )
+        self.assertEqual(list(workspace.rglob("*.tmp")), [])
+        self.assertFalse((workspace / ".transactions").exists())
+
+    def test_respond_publish_failure_leaves_no_artifact_event_or_state_drift(self) -> None:
+        human = self._needs_human_workspace()
+        workspace = self.store.resolve(str(human["workspace"]), self.repo)
+        before = {
+            relative: (workspace / relative).read_bytes()
+            for relative in ("state.json", "events.jsonl")
+        }
+        with patch.object(self.store, "_publish_staged", side_effect=OSError("respond publish failure")):
+            with self.assertRaisesRegex(OSError, "respond publish failure"):
+                self.service.respond(human["workspace"], self.repo, "sensitive approval")
+        self.assertEqual({relative: (workspace / relative).read_bytes() for relative in before}, before)
+        self.assertFalse((workspace / "artifacts" / "human").exists())
+        self.assertEqual(self.service.respond(human["workspace"], self.repo, "sensitive approval")["status"], "ready")
+
+    def test_handoff_publish_failure_leaves_route_and_event_stream_coherent(self) -> None:
+        ready = self.start_and_submit_plan()
+        workspace = self.store.resolve(str(ready["workspace"]), self.repo)
+        before = {
+            relative: (workspace / relative).read_bytes()
+            for relative in ("state.json", "events.jsonl")
+        }
+        with patch.object(self.store, "_publish_staged", side_effect=OSError("handoff publish failure")):
+            with self.assertRaisesRegex(OSError, "handoff publish failure"):
+                self.service.handoff(ready["workspace"], self.repo, "host/codex", "host/claude")
+        self.assertEqual({relative: (workspace / relative).read_bytes() for relative in before}, before)
+        self.assertEqual(
+            self.service.handoff(ready["workspace"], self.repo, "host/codex", "host/claude")["supervisor_route"],
+            "host/claude",
+        )
+
     def test_terminal_workspace_cannot_mutate(self) -> None:
         action = self.service.start("ship feature", self.repo, "host/codex")
         workspace = self.store.resolve(str(action["workspace"]), self.repo)
@@ -291,3 +394,15 @@ class TwinServiceTest(TestCase):
         self.assertEqual(result["artifact"]["relative"], expected)
         events = (workspace / "events.jsonl").read_text(encoding="utf-8")
         self.assertNotIn("sensitive approval", events)
+
+    def _needs_human_workspace(self) -> dict[str, object]:
+        self.start_and_submit_plan()
+        run = self.service.run(None, self.repo, "host/codex")
+        review = self.service.submit_instruction(
+            run["workspace"], "host/codex", run["state_revision"], run["action_token"],
+            run["context"]["metadata"]["run_id"], {"updates": []},
+        )
+        return self.service.submit_review(
+            review["workspace"], "host/codex", review["state_revision"], review["action_token"],
+            review["context"]["metadata"]["run_id"], {"decision": "needs_human"},
+        )

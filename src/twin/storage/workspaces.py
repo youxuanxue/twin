@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
 import re
 import secrets
+import shutil
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -89,7 +91,9 @@ class WorkspaceStore:
 
     def load_state(self, workspace: Path) -> dict[str, object]:
         workspace = self._workspace_path(workspace)
-        value = self._read_json(workspace / "state.json")
+        with self._lock(workspace):
+            self._recover_locked(workspace)
+            value = self._load_state_unlocked(workspace)
         if not isinstance(value, dict):
             raise ValueError("state must be an object")
         return value
@@ -98,56 +102,31 @@ class WorkspaceStore:
         self, workspace: Path, expected_revision: int, value: dict[str, object]
     ) -> None:
         workspace = self._workspace_path(workspace)
-        with self._lock(workspace):
-            current = self.load_state(workspace)
-            revision = current.get("state_revision")
-            if revision != expected_revision:
-                raise ValueError(
-                    f"state revision mismatch: expected {expected_revision}, found {revision}"
-                )
-            if value.get("workspace_id") != current.get("workspace_id"):
-                raise ValueError("state workspace_id mismatch")
-            value = dict(value)
-            next_revision = expected_revision + 1
-            value["state_revision"] = next_revision
-            self._write_json(workspace / "state.json", value)
-            workspace_id = value["workspace_id"]
-            if not isinstance(workspace_id, str):
-                raise ValueError("state workspace_id mismatch")
-            append_jsonl(
-                workspace / "events.jsonl",
-                event_record(
-                    workspace_id=workspace_id,
-                    state_revision=next_revision,
-                    event={"event": "state_replaced", "details": {}},
-                ),
-            )
+        self.commit_action(
+            workspace, expected_revision, value,
+            documents={}, artifacts={}, event=None, validate_current=lambda current: None,
+        )
 
     def append_event(self, workspace: Path, event: dict[str, object]) -> None:
         workspace = self._workspace_path(workspace)
         with self._lock(workspace):
-            state = self.load_state(workspace)
-            workspace_id = state.get("workspace_id")
-            revision = state.get("state_revision")
-            if not isinstance(workspace_id, str) or not isinstance(revision, int):
-                raise ValueError("invalid workspace state")
-            append_jsonl(
-                workspace / "events.jsonl",
-                event_record(workspace_id=workspace_id, state_revision=revision, event=event),
-            )
+            self._recover_locked(workspace)
+            self._append_event_locked(workspace, event)
 
     def write_artifact(
         self, workspace: Path, relative: str, body: bytes
     ) -> dict[str, object]:
         workspace = self._workspace_path(workspace)
-        target = self._artifact_path(workspace, relative)
-        write_bytes(target, body)
-        metadata: dict[str, object] = {
-            "relative": str(target.relative_to(workspace)),
-            "sha256": hashlib.sha256(body).hexdigest(),
-            "bytes": len(body),
-        }
-        self.append_event(workspace, {"event": "artifact_written", "details": metadata})
+        with self._lock(workspace):
+            self._recover_locked(workspace)
+            target = self._artifact_path(workspace, relative)
+            write_bytes(target, body)
+            metadata: dict[str, object] = {
+                "relative": str(target.relative_to(workspace)),
+                "sha256": hashlib.sha256(body).hexdigest(),
+                "bytes": len(body),
+            }
+            self._append_event_locked(workspace, {"event": "artifact_written", "details": metadata})
         return metadata
 
     def commit_action(
@@ -158,13 +137,14 @@ class WorkspaceStore:
         *,
         documents: dict[str, bytes],
         artifacts: dict[str, bytes],
-        event: dict[str, object],
+        event: dict[str, object] | None,
         validate_current: Callable[[dict[str, object]], None],
     ) -> None:
         """Publish an action's documents, artifacts, state, and events under one workspace lock."""
         workspace = self._workspace_path(workspace)
         with self._lock(workspace):
-            current = self.load_state(workspace)
+            self._recover_locked(workspace)
+            current = self._load_state_unlocked(workspace)
             revision = current.get("state_revision")
             if revision != expected_revision:
                 raise ValueError(
@@ -194,7 +174,7 @@ class WorkspaceStore:
             next_state = dict(value)
             next_state["state_revision"] = next_revision
             targets[workspace / "state.json"] = self._json_bytes(next_state)
-            records = [
+            records: list[dict[str, object]] = [
                 event_record(
                     workspace_id=workspace_id,
                     state_revision=next_revision,
@@ -208,22 +188,174 @@ class WorkspaceStore:
                     )
                     for metadata in artifact_metadata
                 ],
-                event_record(
-                    workspace_id=workspace_id, state_revision=next_revision, event=event
-                ),
             ]
+            if event is not None:
+                records.append(
+                    event_record(
+                        workspace_id=workspace_id, state_revision=next_revision, event=event
+                    )
+                )
             prior_events = (workspace / "events.jsonl").read_bytes()
             targets[workspace / "events.jsonl"] = prior_events + b"".join(
                 json.dumps(record, ensure_ascii=False, sort_keys=True).encode("utf-8") + b"\n"
                 for record in records
             )
-            staged = {target: self._stage_bytes(target, body) for target, body in targets.items()}
             previous = {target: target.read_bytes() if target.exists() else None for target in targets}
+            transaction_id = secrets.token_hex(16)
+            transaction_dir = workspace / ".transactions" / transaction_id
+            journal = workspace / ".transaction.json"
+            created_directories = self._missing_parent_dirs(workspace, targets)
+            self._write_json(
+                journal,
+                self._transaction_journal(
+                    transaction_id, workspace, previous, created_directories
+                ),
+            )
+            staged: dict[Path, Path] = {}
             try:
+                for directory in created_directories:
+                    directory.mkdir(parents=True, exist_ok=True)
+                transaction_dir.mkdir(parents=True, exist_ok=False)
+                for index, (target, body) in enumerate(targets.items()):
+                    staged[target] = self._stage_bytes(transaction_dir / f"{index}.stage", body)
                 self._publish_staged(staged, previous, workspace / "state.json")
+            except BaseException:
+                self._recover_locked(workspace)
+                raise
+            else:
+                self._cleanup_transaction_dir(workspace, transaction_id)
+                journal.unlink(missing_ok=True)
             finally:
                 for temporary in staged.values():
                     temporary.unlink(missing_ok=True)
+
+    def _load_state_unlocked(self, workspace: Path) -> dict[str, object]:
+        value = self._read_json(workspace / "state.json")
+        if not isinstance(value, dict):
+            raise ValueError("state must be an object")
+        return value
+
+    def _append_event_locked(self, workspace: Path, event: dict[str, object]) -> None:
+        state = self._load_state_unlocked(workspace)
+        workspace_id = state.get("workspace_id")
+        revision = state.get("state_revision")
+        if not isinstance(workspace_id, str) or not isinstance(revision, int):
+            raise ValueError("invalid workspace state")
+        append_jsonl(
+            workspace / "events.jsonl",
+            event_record(workspace_id=workspace_id, state_revision=revision, event=event),
+        )
+
+    def _transaction_journal(
+        self,
+        transaction_id: str,
+        workspace: Path,
+        previous: dict[Path, bytes | None],
+        created_directories: list[Path],
+    ) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "transaction_id": transaction_id,
+            "created_directories": [
+                str(directory.relative_to(workspace)) for directory in created_directories
+            ],
+            "targets": [
+                {
+                    "relative": str(target.relative_to(workspace)),
+                    "before": None if body is None else base64.b64encode(body).decode("ascii"),
+                }
+                for target, body in previous.items()
+            ],
+        }
+
+    def _recover_locked(self, workspace: Path) -> None:
+        journal = workspace / ".transaction.json"
+        if not journal.is_file():
+            return
+        try:
+            value = self._read_json(journal)
+            transaction_id = value.get("transaction_id") if isinstance(value, dict) else None
+            targets = value.get("targets") if isinstance(value, dict) else None
+            created = value.get("created_directories", []) if isinstance(value, dict) else None
+            if (
+                not isinstance(transaction_id, str)
+                or not transaction_id
+                or not isinstance(targets, list)
+                or not isinstance(created, list)
+            ):
+                raise ValueError("invalid transaction journal")
+            snapshots: list[tuple[Path, bytes | None]] = []
+            for entry in targets:
+                if not isinstance(entry, dict):
+                    raise ValueError("invalid transaction journal")
+                relative = entry.get("relative")
+                before = entry.get("before")
+                if not isinstance(relative, str) or before is not None and not isinstance(before, str):
+                    raise ValueError("invalid transaction journal")
+                target = self._transaction_target(workspace, relative)
+                body = None if before is None else base64.b64decode(before.encode("ascii"), validate=True)
+                snapshots.append((target, body))
+            created_directories = [
+                self._transaction_directory(workspace, relative)
+                for relative in created
+                if isinstance(relative, str)
+            ]
+            if len(created_directories) != len(created):
+                raise ValueError("invalid transaction journal")
+        except (OSError, ValueError, TypeError) as exc:
+            raise ValueError("invalid transaction journal") from exc
+        for target, body in snapshots:
+            if body is None:
+                target.unlink(missing_ok=True)
+            else:
+                write_bytes(target, body)
+        for directory in reversed(created_directories):
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+        self._cleanup_transaction_dir(workspace, transaction_id)
+        journal.unlink(missing_ok=True)
+
+    def _transaction_target(self, workspace: Path, relative: str) -> Path:
+        candidate = Path(relative)
+        if not relative or candidate.is_absolute() or relative.startswith(".transactions/"):
+            raise ValueError("invalid transaction journal")
+        target = (workspace / candidate).resolve()
+        try:
+            target.relative_to(workspace)
+        except ValueError as exc:
+            raise ValueError("invalid transaction journal") from exc
+        if target == workspace / ".transaction.json":
+            raise ValueError("invalid transaction journal")
+        return target
+
+    def _transaction_directory(self, workspace: Path, relative: str) -> Path:
+        directory = self._transaction_target(workspace, relative)
+        if directory == workspace or directory.name in {
+            ".transaction.json", "goal.yaml", "plan.yaml", "state.json", "events.jsonl"
+        }:
+            raise ValueError("invalid transaction journal")
+        return directory
+
+    @staticmethod
+    def _missing_parent_dirs(workspace: Path, targets: dict[Path, bytes]) -> list[Path]:
+        missing: set[Path] = set()
+        for target in targets:
+            parent = target.parent
+            while parent != workspace and not parent.exists():
+                missing.add(parent)
+                parent = parent.parent
+        return sorted(missing, key=lambda path: len(path.parts))
+
+    @staticmethod
+    def _cleanup_transaction_dir(workspace: Path, transaction_id: str) -> None:
+        root = workspace / ".transactions"
+        shutil.rmtree(root / transaction_id, ignore_errors=True)
+        try:
+            root.rmdir()
+        except OSError:
+            pass
 
     def _new_workspace_id(self, request: str) -> str:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -306,17 +438,6 @@ class WorkspaceStore:
     def _publish_staged(
         staged: dict[Path, Path], previous: dict[Path, bytes | None], state_path: Path
     ) -> None:
-        published: list[Path] = []
         ordered = [target for target in staged if target != state_path] + [state_path]
-        try:
-            for target in ordered:
-                os.replace(staged[target], target)
-                published.append(target)
-        except BaseException:
-            for target in reversed(published):
-                old = previous[target]
-                if old is None:
-                    target.unlink(missing_ok=True)
-                else:
-                    write_bytes(target, old)
-            raise
+        for target in ordered:
+            os.replace(staged[target], target)
