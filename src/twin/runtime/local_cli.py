@@ -148,7 +148,7 @@ class LocalCliRuntime:
                 return None
             records.append(value)
         if not records:
-            return "", default_session_id, ()
+            return None
         if provider in {"claude", "claude_headless"}:
             return self._parse_claude_records(records, default_session_id)
         return self._parse_json_records(records, default_session_id)

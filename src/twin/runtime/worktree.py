@@ -34,11 +34,13 @@ class GitWorkspaceIsolation:
         path = self._worktree_path(repo, safe_id)
         if not path.exists():
             return True
-        self._validate_existing_worktree(repo, path, self._branch_name(safe_id))
+        branch = self._branch_name(safe_id)
+        self._validate_existing_worktree(repo, path, branch)
         if not self._is_clean(path):
             return False
+        if not self._branch_reachable_from_target_head(repo, branch):
+            return False
         self._git(repo, "worktree", "remove", "--force", str(path))
-        branch = self._branch_name(safe_id)
         if self._branch_exists(repo, branch):
             self._git(repo, "branch", "-D", branch)
         return True
@@ -99,6 +101,11 @@ class GitWorkspaceIsolation:
 
     def _branch_exists(self, repo: Path, branch: str) -> bool:
         return self._git(repo, "rev-parse", "--verify", "--quiet", branch, check=False).returncode == 0
+
+    def _branch_reachable_from_target_head(self, repo: Path, branch: str) -> bool:
+        return self._git(
+            repo, "merge-base", "--is-ancestor", branch, "HEAD", check=False
+        ).returncode == 0
 
     def _common_git_dir(self, cwd: Path) -> Path:
         raw = Path(self._git(cwd, "rev-parse", "--git-common-dir").stdout.strip())

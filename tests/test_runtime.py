@@ -118,6 +118,22 @@ class RuntimeAdapterTest(TestCase):
         self.assertEqual(result.events[0]["failure_kind"], "malformed_output")
         self.assertIn("malformed provider output", result.output_text)
 
+    def test_local_cli_rejects_empty_provider_output(self) -> None:
+        runtime = LocalCliRuntime(
+            executables={"codex": ["codex"]},
+            process_runner=_StaticProcessRunner(stdout="", returncode=0),
+        )
+        result = runtime.run_turn(WorkerTurnRequest(
+            prompt="do work",
+            cwd=self.root,
+            provider="codex",
+            session_id="",
+            timeout_seconds=5,
+        ))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.events[0]["failure_kind"], "malformed_output")
+        self.assertIn("malformed provider output", result.output_text)
+
     def test_local_cli_rejects_unsupported_budget_environment(self) -> None:
         runtime = LocalCliRuntime(executables={
             "codex": [sys.executable, str(self.fake_provider), "codex"],
@@ -244,6 +260,16 @@ class RuntimeAdapterTest(TestCase):
         self.assertNotEqual(unauthorized.returncode, 0)
         self.assertEqual(unauthorized.events[0]["failure_kind"], "cao_auth_failed")
 
+    def test_cao_timeout_is_classified_as_timed_out(self) -> None:
+        server = _CaoTestServer()
+        self.addCleanup(server.close)
+        result = CaoRuntime(server.url("/slow"), auth_token="token", provider="codex", agent="worker").run_turn(
+            WorkerTurnRequest("do work", self.root, "codex", "", 0.05)
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(result.timed_out)
+        self.assertEqual(result.events[0]["failure_kind"], "timeout")
+
 
 class WorktreeIsolationTest(TestCase):
     def setUp(self) -> None:
@@ -298,6 +324,20 @@ class WorktreeIsolationTest(TestCase):
         (worktree / "unsaved.txt").write_text("keep", encoding="utf-8")
         self.assertFalse(self.isolation.cleanup(repo, "ws-1"))
         self.assertTrue(worktree.exists())
+
+    def test_cleanup_preserves_clean_worktree_with_unintegrated_commit(self) -> None:
+        repo = self.root / "repo"
+        init_repo(repo)
+        worktree = self.isolation.prepare(repo, "ws-1")
+        (worktree / "feature.txt").write_text("worker output\n", encoding="utf-8")
+        git(worktree, "add", "feature.txt")
+        git(worktree, "commit", "-m", "worker output")
+
+        self.assertFalse(self.isolation.cleanup(repo, "ws-1"))
+
+        self.assertTrue(worktree.exists())
+        self.assertEqual(git(worktree, "branch", "--show-current").stdout.strip(), "twin/ws-1")
+        self.assertEqual(git(repo, "rev-parse", "--verify", "twin/ws-1").returncode, 0)
 
     def test_prepare_uses_full_workspace_id_not_only_basename(self) -> None:
         repo = self.root / "repo"
@@ -357,6 +397,31 @@ class TwinServiceRuntimeIntegrationTest(TestCase):
         self.assertIn("runs/" + run_id + "/result.json", event_stream)
         self.assertNotIn("deterministic fake output", event_stream)
 
+    def test_prepare_failure_persists_failed_evidence_and_review_required_state(self) -> None:
+        service = TwinService(
+            self.store,
+            runtime=self.runtime,
+            isolation=_FailingIsolation(),
+        )
+        start = service.start("ship feature", self.repo, "host/codex")
+        ready = service.submit_plan(
+            start["workspace"], "host/codex", start["state_revision"], start["action_token"],
+            valid_goal_and_plan(),
+        )
+
+        review = service.run(ready["workspace"], self.repo, "host/codex")
+
+        workspace = self.store.resolve(str(review["workspace"]), self.repo)
+        run_id = review["context"]["metadata"]["run_id"]
+        state = self.store.load_state(workspace)
+        result_payload = json.loads((workspace / "runs" / run_id / "result.json").read_text(encoding="utf-8"))
+        evidence_payload = json.loads((workspace / "runs" / run_id / "evidence.json").read_text(encoding="utf-8"))
+        self.assertEqual(review["action"], "review")
+        self.assertEqual(state["status"], "review_required")
+        self.assertEqual(result_payload["events"][0]["failure_kind"], "isolation_prepare_failed")
+        self.assertEqual(evidence_payload["status"], "failed")
+        self.assertEqual(self.runtime.requests, [])
+
 
 class _CaoTestHandler(BaseHTTPRequestHandler):
     server: "_CaoHttpServer"
@@ -368,6 +433,8 @@ class _CaoTestHandler(BaseHTTPRequestHandler):
             self.send_header("Location", self.server.url("/ok"))
             self.end_headers()
             return
+        if self.path == "/slow":
+            time.sleep(0.2)
         if self.path == "/auth" and self.headers.get("Authorization") != "Bearer token":
             self.send_response(401)
             self.end_headers()
@@ -385,7 +452,10 @@ class _CaoTestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
-        self.wfile.write(encoded)
+        try:
+            self.wfile.write(encoded)
+        except BrokenPipeError:
+            return
 
     def log_message(self, format: str, *args: Any) -> None:
         return
@@ -444,6 +514,16 @@ class _DeterministicIsolation:
         return True
 
 
+class _FailingIsolation:
+    def prepare(self, repo_root: Path, workspace_id: str) -> Path:
+        del repo_root, workspace_id
+        raise RuntimeError("prepare exploded")
+
+    def cleanup(self, repo_root: Path, workspace_id: str) -> bool:
+        del repo_root, workspace_id
+        raise AssertionError("cleanup must not run when prepare failed")
+
+
 class _RecordingProcessRunner:
     def __init__(self) -> None:
         self.argv: list[str] = []
@@ -467,5 +547,28 @@ class _RecordingProcessRunner:
             }) + "\n",
             stderr="",
             returncode=0,
+            timed_out=False,
+        )
+
+
+class _StaticProcessRunner:
+    def __init__(self, *, stdout: str, returncode: int) -> None:
+        self.stdout = stdout
+        self.returncode = returncode
+
+    def run(
+        self,
+        argv: list[str],
+        *,
+        cwd: Path,
+        environment: dict[str, str],
+        timeout_seconds: float,
+        input_text: str | None = None,
+    ) -> ProcessResult:
+        del argv, cwd, environment, timeout_seconds, input_text
+        return ProcessResult(
+            stdout=self.stdout,
+            stderr="",
+            returncode=self.returncode,
             timed_out=False,
         )

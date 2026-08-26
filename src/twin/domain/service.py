@@ -286,8 +286,7 @@ class TwinService:
         cwd = repo_root.expanduser().resolve()
         cleanup_result: bool | None = None
         cleanup_error: str | None = None
-        if self.isolation is not None:
-            cwd = self.isolation.prepare(cwd, workspace_id)
+        prepared = False
         request = WorkerTurnRequest(
             prompt=self._worker_prompt(workspace, action),
             cwd=cwd,
@@ -296,18 +295,43 @@ class TwinService:
             timeout_seconds=self.timeout_seconds,
             environment={},
         )
+        result: WorkerTurnResult | None = None
+        if self.isolation is not None:
+            try:
+                cwd = self.isolation.prepare(cwd, workspace_id)
+            except Exception as exc:
+                result = WorkerTurnResult(
+                    output_text=f"isolation prepare failed: {exc}",
+                    returncode=1,
+                    session_id=request.session_id,
+                    events=({
+                        "event": "failure",
+                        "failure_kind": "isolation_prepare_failed",
+                        "error": str(exc),
+                    },),
+                )
+            else:
+                prepared = True
+                request = WorkerTurnRequest(
+                    prompt=request.prompt,
+                    cwd=cwd,
+                    provider=request.provider,
+                    session_id=request.session_id,
+                    timeout_seconds=request.timeout_seconds,
+                    environment=request.environment,
+                )
         assert self.runtime is not None and hasattr(self.runtime, "run_turn")
-        try:
-            result = self.runtime.run_turn(request)  # type: ignore[union-attr]
-        except Exception as exc:
-            result = WorkerTurnResult(
-                output_text=f"runtime failed: {exc}",
-                returncode=1,
-                session_id=request.session_id,
-                events=({"event": "failure", "failure_kind": "runtime_exception", "error": str(exc)},),
-            )
-        finally:
-            if self.isolation is not None:
+        if result is None:
+            try:
+                result = self.runtime.run_turn(request)  # type: ignore[union-attr]
+            except Exception as exc:
+                result = WorkerTurnResult(
+                    output_text=f"runtime failed: {exc}",
+                    returncode=1,
+                    session_id=request.session_id,
+                    events=({"event": "failure", "failure_kind": "runtime_exception", "error": str(exc)},),
+                )
+            if self.isolation is not None and prepared:
                 try:
                     cleanup_result = self.isolation.cleanup(repo_root.expanduser().resolve(), workspace_id)
                 except Exception as exc:

@@ -55,13 +55,15 @@ class CaoRuntime:
         try:
             with self.opener.open(outbound, timeout=request.timeout_seconds) as response:
                 response_body = response.read()
+        except (TimeoutError, socket.timeout) as exc:
+            return self._failure("timeout", request, {"error": str(exc)}, timed_out=True)
         except error.HTTPError as exc:
             if 300 <= exc.code < 400:
                 return self._failure("cao_redirect_blocked", request)
             if exc.code in {401, 403}:
                 return self._failure("cao_auth_failed", request)
             return self._failure("cao_http_error", request, {"status": exc.code})
-        except (OSError, TimeoutError) as exc:
+        except OSError as exc:
             return self._failure("cao_request_failed", request, {"error": str(exc)})
         try:
             value = json.loads(response_body.decode("utf-8"))
@@ -115,6 +117,8 @@ class CaoRuntime:
         kind: str,
         request: WorkerTurnRequest,
         metadata: dict[str, object] | None = None,
+        *,
+        timed_out: bool = False,
     ) -> WorkerTurnResult:
         event: dict[str, object] = {"event": "failure", "failure_kind": kind, "provider": request.provider}
         if metadata:
@@ -124,4 +128,5 @@ class CaoRuntime:
             returncode=1,
             session_id=request.session_id,
             events=(event,),
+            timed_out=timed_out,
         )
