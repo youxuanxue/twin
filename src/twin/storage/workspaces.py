@@ -20,22 +20,20 @@ from twin.yaml_codec import dump_yaml
 
 
 _TRANSACTION_ID = re.compile(r"[0-9a-f]{32}")
+_TRANSACTION_STAGE = re.compile(r"\.twin-txn-([0-9a-f]{32})-([0-9]+)\.stage")
+_TRANSACTION_STAGE_PREFIX = ".twin-txn-"
+_TRANSACTION_JOURNAL = ".transaction.json"
 _DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
 @dataclass
-class _TransactionNamespace:
-    workspace_fd: int
-    root_fd: int | None
-    transaction_fd: int | None
-    transaction_id: str
-    root_identity: tuple[int, int]
-    transaction_identity: tuple[int, int]
+class _StagedFile:
+    name: str
+    descriptor: int
+    identity: tuple[int, int]
 
     def close(self) -> None:
-        for descriptor in (self.transaction_fd, self.root_fd, self.workspace_fd):
-            if descriptor is not None:
-                os.close(descriptor)
+        os.close(self.descriptor)
 
 
 class WorkspaceStore:
@@ -162,97 +160,139 @@ class WorkspaceStore:
         """Publish an action's documents, artifacts, state, and events under one workspace lock."""
         workspace = self._workspace_path(workspace)
         with self._lock(workspace):
-            self._recover_locked(workspace)
-            current = self._load_state_unlocked(workspace)
-            revision = current.get("state_revision")
-            if revision != expected_revision:
-                raise ValueError(
-                    f"state revision mismatch: expected {expected_revision}, found {revision}"
+            workspace_fd = self._open_workspace_directory(workspace)
+            try:
+                self._recover_locked(workspace, workspace_fd)
+                self._commit_action_locked(
+                    workspace,
+                    workspace_fd,
+                    expected_revision,
+                    value,
+                    documents,
+                    artifacts,
+                    event,
+                    validate_current,
                 )
-            validate_current(current)
-            if value.get("workspace_id") != current.get("workspace_id"):
-                raise ValueError("state workspace_id mismatch")
-            workspace_id = current.get("workspace_id")
-            if not isinstance(workspace_id, str):
-                raise ValueError("state workspace_id mismatch")
-            targets: dict[Path, bytes] = {}
-            for relative, body in documents.items():
-                if relative not in {"goal.yaml", "plan.yaml"}:
-                    raise ValueError("document path is not writable")
-                targets[workspace / relative] = body
-            artifact_metadata: list[dict[str, object]] = []
-            for relative, body in artifacts.items():
-                target = self._artifact_path(workspace, relative)
-                targets[target] = body
-                artifact_metadata.append({
-                    "relative": str(target.relative_to(workspace)),
-                    "sha256": hashlib.sha256(body).hexdigest(),
-                    "bytes": len(body),
-                })
-            next_revision = expected_revision + 1
-            next_state = dict(value)
-            next_state["state_revision"] = next_revision
-            targets[workspace / "state.json"] = self._json_bytes(next_state)
-            records: list[dict[str, object]] = [
+            finally:
+                os.close(workspace_fd)
+
+    def _commit_action_locked(
+        self,
+        workspace: Path,
+        workspace_fd: int,
+        expected_revision: int,
+        value: dict[str, object],
+        documents: dict[str, bytes],
+        artifacts: dict[str, bytes],
+        event: dict[str, object] | None,
+        validate_current: Callable[[dict[str, object]], None],
+    ) -> None:
+        current = self._read_json_entry(workspace_fd, "state.json")
+        if not isinstance(current, dict):
+            raise ValueError("state must be an object")
+        revision = current.get("state_revision")
+        if revision != expected_revision:
+            raise ValueError(
+                f"state revision mismatch: expected {expected_revision}, found {revision}"
+            )
+        validate_current(current)
+        if value.get("workspace_id") != current.get("workspace_id"):
+            raise ValueError("state workspace_id mismatch")
+        workspace_id = current.get("workspace_id")
+        if not isinstance(workspace_id, str):
+            raise ValueError("state workspace_id mismatch")
+        targets: dict[Path, bytes] = {}
+        for relative, body in documents.items():
+            if relative not in {"goal.yaml", "plan.yaml"}:
+                raise ValueError("document path is not writable")
+            targets[workspace / relative] = body
+        artifact_metadata: list[dict[str, object]] = []
+        for relative, body in artifacts.items():
+            target = self._artifact_path(workspace, relative)
+            targets[target] = body
+            artifact_metadata.append({
+                "relative": str(target.relative_to(workspace)),
+                "sha256": hashlib.sha256(body).hexdigest(),
+                "bytes": len(body),
+            })
+        next_revision = expected_revision + 1
+        next_state = dict(value)
+        next_state["state_revision"] = next_revision
+        targets[workspace / "state.json"] = self._json_bytes(next_state)
+        records: list[dict[str, object]] = [
+            event_record(
+                workspace_id=workspace_id,
+                state_revision=next_revision,
+                event={"event": "state_replaced", "details": {}},
+            ),
+            *[
                 event_record(
                     workspace_id=workspace_id,
                     state_revision=next_revision,
-                    event={"event": "state_replaced", "details": {}},
-                ),
-                *[
-                    event_record(
-                        workspace_id=workspace_id,
-                        state_revision=next_revision,
-                        event={"event": "artifact_written", "details": metadata},
-                    )
-                    for metadata in artifact_metadata
-                ],
-            ]
-            if event is not None:
-                records.append(
-                    event_record(
-                        workspace_id=workspace_id, state_revision=next_revision, event=event
-                    )
+                    event={"event": "artifact_written", "details": metadata},
                 )
-            prior_events = (workspace / "events.jsonl").read_bytes()
-            targets[workspace / "events.jsonl"] = prior_events + b"".join(
-                json.dumps(record, ensure_ascii=False, sort_keys=True).encode("utf-8") + b"\n"
-                for record in records
+                for metadata in artifact_metadata
+            ],
+        ]
+        if event is not None:
+            records.append(
+                event_record(
+                    workspace_id=workspace_id, state_revision=next_revision, event=event
+                )
             )
-            previous = {target: target.read_bytes() if target.exists() else None for target in targets}
-            transaction_id = secrets.token_hex(16)
-            journal = workspace / ".transaction.json"
-            created_directories = self._missing_parent_dirs(workspace, targets)
-            namespace = self._create_transaction_namespace(workspace, transaction_id)
-            staged: dict[Path, str] = {}
-            try:
-                self._write_json(
-                    journal,
-                    self._transaction_journal(
-                        namespace, workspace, previous, created_directories
-                    ),
+        prior_events = self._read_target_bytes(workspace_fd, "events.jsonl")
+        if prior_events is None:
+            raise ValueError("workspace event stream is missing")
+        targets[workspace / "events.jsonl"] = prior_events + b"".join(
+            json.dumps(record, ensure_ascii=False, sort_keys=True).encode("utf-8") + b"\n"
+            for record in records
+        )
+        transaction_id = secrets.token_hex(16)
+        staged: dict[Path, _StagedFile] = {}
+        journal_created = False
+        previous = {
+            target: self._read_target_bytes(
+                workspace_fd, str(target.relative_to(workspace))
+            )
+            for target in targets
+        }
+        created_directories = self._missing_parent_dirs(workspace, targets)
+        try:
+            self._reject_unowned_stage_entries(workspace_fd)
+            for index, (target, body) in enumerate(targets.items()):
+                staged[target] = self._stage_bytes(
+                    workspace_fd, self._stage_name(transaction_id, index), body
                 )
-                for directory in created_directories:
-                    directory.mkdir(parents=True, exist_ok=True)
-                for index, (target, body) in enumerate(targets.items()):
-                    staged[target] = self._stage_bytes(
-                        namespace.transaction_fd, f"{index}.stage", body
-                    )
-                self._assert_transaction_namespace(workspace, namespace)
-                self._publish_staged(
-                    staged, previous, workspace / "state.json", namespace.transaction_fd
-                )
-            except BaseException:
-                if journal.is_file():
-                    self._recover_locked(workspace)
-                else:
-                    self._cleanup_transaction_namespace(namespace, set())
-                raise
+            journal_identity = self._write_transaction_journal(
+                workspace_fd,
+                transaction_id,
+                self._transaction_journal(
+                    transaction_id,
+                    self._descriptor_identity(workspace_fd),
+                    workspace,
+                    previous,
+                    created_directories,
+                    list(staged.values()),
+                ),
+            )
+            journal_created = True
+            self._publish_staged(
+                staged, previous, workspace / "state.json", workspace_fd
+            )
+        except BaseException:
+            if journal_created or self._entry_exists(workspace_fd, _TRANSACTION_JOURNAL):
+                self._recover_locked(workspace, workspace_fd)
             else:
-                self._cleanup_transaction_namespace(namespace, set(staged.values()))
-                journal.unlink(missing_ok=True)
-            finally:
-                namespace.close()
+                self._cleanup_staged_files(workspace_fd, list(staged.values()))
+            raise
+        else:
+            self._cleanup_staged_files(workspace_fd, list(staged.values()))
+            self._unlink_matching_entry(
+                workspace_fd, _TRANSACTION_JOURNAL, journal_identity
+            )
+        finally:
+            for stage in staged.values():
+                stage.close()
 
     def _load_state_unlocked(self, workspace: Path) -> dict[str, object]:
         value = self._read_json(workspace / "state.json")
@@ -273,22 +313,29 @@ class WorkspaceStore:
 
     def _transaction_journal(
         self,
-        namespace: _TransactionNamespace,
+        transaction_id: str,
+        workspace_identity: tuple[int, int],
         workspace: Path,
         previous: dict[Path, bytes | None],
         created_directories: list[Path],
+        staged: list[_StagedFile],
     ) -> dict[str, object]:
         return {
-            "schema_version": 2,
-            "transaction_id": namespace.transaction_id,
-            "transaction_root_identity": {
-                "device": namespace.root_identity[0],
-                "inode": namespace.root_identity[1],
+            "schema_version": 3,
+            "transaction_id": transaction_id,
+            "workspace_identity": {
+                "device": workspace_identity[0],
+                "inode": workspace_identity[1],
             },
-            "transaction_identity": {
-                "device": namespace.transaction_identity[0],
-                "inode": namespace.transaction_identity[1],
-            },
+            "journal_stage_name": self._journal_stage_name(transaction_id),
+            "stage_files": [
+                {
+                    "name": stage.name,
+                    "device": stage.identity[0],
+                    "inode": stage.identity[1],
+                }
+                for stage in staged
+            ],
             "created_directories": [
                 str(directory.relative_to(workspace)) for directory in created_directories
             ],
@@ -301,34 +348,68 @@ class WorkspaceStore:
             ],
         }
 
-    def _recover_locked(self, workspace: Path) -> None:
-        journal = workspace / ".transaction.json"
+    def _recover_locked(self, workspace: Path, workspace_fd: int | None = None) -> None:
+        owns_workspace_fd = workspace_fd is None
+        if workspace_fd is None:
+            workspace_fd = self._open_workspace_directory(workspace)
         try:
-            journal_status = os.stat(journal, follow_symlinks=False)
-        except FileNotFoundError:
-            return
-        if not stat.S_ISREG(journal_status.st_mode):
-            raise ValueError("invalid transaction journal")
-        namespace: _TransactionNamespace | None = None
-        try:
-            value = self._read_json(journal)
+            try:
+                journal_status = os.stat(
+                    _TRANSACTION_JOURNAL,
+                    dir_fd=workspace_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                self._reject_unowned_stage_entries(workspace_fd)
+                if owns_workspace_fd:
+                    os.close(workspace_fd)
+                return
+            if not stat.S_ISREG(journal_status.st_mode):
+                raise ValueError("invalid transaction journal")
+            value = self._read_json_entry(
+                workspace_fd,
+                _TRANSACTION_JOURNAL,
+                expected_identity=self._identity(journal_status),
+            )
             transaction_id = value.get("transaction_id") if isinstance(value, dict) else None
             targets = value.get("targets") if isinstance(value, dict) else None
             created = value.get("created_directories", []) if isinstance(value, dict) else None
-            root_identity = self._journal_identity(value, "transaction_root_identity")
-            transaction_identity = self._journal_identity(value, "transaction_identity")
+            stages = value.get("stage_files") if isinstance(value, dict) else None
+            journal_stage = value.get("journal_stage_name") if isinstance(value, dict) else None
+            workspace_identity = self._journal_identity(value, "workspace_identity")
             if (
-                value.get("schema_version") != 2
+                value.get("schema_version") != 3
                 or not isinstance(transaction_id, str)
-                or not transaction_id
+                or _TRANSACTION_ID.fullmatch(transaction_id) is None
                 or not isinstance(targets, list)
                 or not isinstance(created, list)
+                or not isinstance(stages, list)
+                or journal_stage != self._journal_stage_name(transaction_id)
+                or workspace_identity != self._descriptor_identity(workspace_fd)
             ):
                 raise ValueError("invalid transaction journal")
-            namespace = self._open_transaction_namespace(
-                workspace, transaction_id, root_identity, transaction_identity
+            stage_identities = self._journal_stage_identities(
+                transaction_id, stages, len(targets)
             )
-            snapshots: list[tuple[Path, bytes | None]] = []
+            allowed_stage_names = set(stage_identities) | {journal_stage}
+            present_stage_names = {
+                name
+                for name in os.listdir(workspace_fd)
+                if name.startswith(_TRANSACTION_STAGE_PREFIX)
+            }
+            if not present_stage_names.issubset(allowed_stage_names):
+                raise ValueError("invalid transaction journal")
+            for name in present_stage_names:
+                entry = os.stat(name, dir_fd=workspace_fd, follow_symlinks=False)
+                if not stat.S_ISREG(entry.st_mode):
+                    raise ValueError("invalid transaction journal")
+                identity = self._identity(entry)
+                if name == journal_stage:
+                    if identity != self._identity(journal_status):
+                        raise ValueError("invalid transaction journal")
+                elif identity != stage_identities[name]:
+                    raise ValueError("invalid transaction journal")
+            snapshots: list[tuple[str, bytes | None]] = []
             for entry in targets:
                 if not isinstance(entry, dict):
                     raise ValueError("invalid transaction journal")
@@ -338,31 +419,35 @@ class WorkspaceStore:
                     raise ValueError("invalid transaction journal")
                 target = self._transaction_target(workspace, relative)
                 body = None if before is None else base64.b64decode(before.encode("ascii"), validate=True)
-                snapshots.append((target, body))
+                snapshots.append((str(target.relative_to(workspace)), body))
             created_directories = [
-                self._transaction_directory(workspace, relative)
+                str(self._transaction_directory(workspace, relative).relative_to(workspace))
                 for relative in created
                 if isinstance(relative, str)
             ]
             if len(created_directories) != len(created):
                 raise ValueError("invalid transaction journal")
-            expected_stages = {f"{index}.stage" for index in range(len(targets))}
-            self._validate_transaction_namespace_contents(namespace, expected_stages)
         except (OSError, ValueError, TypeError) as exc:
-            if namespace is not None:
-                namespace.close()
+            if owns_workspace_fd:
+                os.close(workspace_fd)
+            if isinstance(exc, ValueError) and str(exc) == "unexpected transaction stage":
+                raise
             raise ValueError("invalid transaction journal") from exc
         try:
-            for target, body in snapshots:
-                if body is None:
-                    target.unlink(missing_ok=True)
-                else:
-                    write_bytes(target, body)
-            self._cleanup_created_directories(created_directories)
-            self._cleanup_transaction_namespace(namespace, expected_stages)
-            journal.unlink(missing_ok=True)
+            for relative, body in snapshots:
+                self._restore_target_bytes(workspace_fd, relative, body)
+            self._cleanup_created_directories(workspace_fd, created_directories)
+            self._cleanup_journal_stages(workspace_fd, stage_identities)
+            if self._entry_exists(workspace_fd, journal_stage):
+                self._unlink_matching_entry(
+                    workspace_fd, journal_stage, self._identity(journal_status)
+                )
+            self._unlink_matching_entry(
+                workspace_fd, _TRANSACTION_JOURNAL, self._identity(journal_status)
+            )
         finally:
-            namespace.close()
+            if owns_workspace_fd:
+                os.close(workspace_fd)
 
     @staticmethod
     def _journal_identity(value: object, key: str) -> tuple[int, int]:
@@ -372,92 +457,6 @@ class WorkspaceStore:
         if not isinstance(device, int) or not isinstance(inode, int):
             raise ValueError("invalid transaction journal")
         return device, inode
-
-    def _create_transaction_namespace(
-        self, workspace: Path, transaction_id: str
-    ) -> _TransactionNamespace:
-        if _TRANSACTION_ID.fullmatch(transaction_id) is None:
-            raise ValueError("invalid transaction ID")
-        workspace_fd = self._open_workspace_directory(workspace)
-        root_fd: int | None = None
-        transaction_fd: int | None = None
-        try:
-            try:
-                os.mkdir(".transactions", 0o700, dir_fd=workspace_fd)
-            except FileExistsError as exc:
-                raise ValueError("unsafe transaction staging namespace") from exc
-            root_fd = self._open_directory_entry(workspace_fd, ".transactions")
-            try:
-                os.mkdir(transaction_id, 0o700, dir_fd=root_fd)
-            except FileExistsError as exc:
-                raise ValueError("unsafe transaction staging namespace") from exc
-            transaction_fd = self._open_directory_entry(root_fd, transaction_id)
-            namespace = _TransactionNamespace(
-                workspace_fd=workspace_fd,
-                root_fd=root_fd,
-                transaction_fd=transaction_fd,
-                transaction_id=transaction_id,
-                root_identity=self._descriptor_identity(root_fd),
-                transaction_identity=self._descriptor_identity(transaction_fd),
-            )
-            self._assert_transaction_namespace(workspace, namespace)
-            return namespace
-        except BaseException:
-            for descriptor in (transaction_fd, root_fd, workspace_fd):
-                if descriptor is not None:
-                    os.close(descriptor)
-            raise
-
-    def _open_transaction_namespace(
-        self,
-        workspace: Path,
-        transaction_id: str,
-        root_identity: tuple[int, int],
-        transaction_identity: tuple[int, int],
-    ) -> _TransactionNamespace:
-        if _TRANSACTION_ID.fullmatch(transaction_id) is None:
-            raise ValueError("invalid transaction journal")
-        workspace_fd = self._open_workspace_directory(workspace)
-        root_fd: int | None = None
-        transaction_fd: int | None = None
-        try:
-            try:
-                root_fd = self._open_directory_entry(workspace_fd, ".transactions")
-            except FileNotFoundError:
-                return _TransactionNamespace(
-                    workspace_fd=workspace_fd,
-                    root_fd=None,
-                    transaction_fd=None,
-                    transaction_id=transaction_id,
-                    root_identity=root_identity,
-                    transaction_identity=transaction_identity,
-                )
-            if self._descriptor_identity(root_fd) != root_identity:
-                raise ValueError("invalid transaction journal")
-            try:
-                transaction_fd = self._open_directory_entry(root_fd, transaction_id)
-            except FileNotFoundError:
-                transaction_fd = None
-            if (
-                transaction_fd is not None
-                and self._descriptor_identity(transaction_fd) != transaction_identity
-            ):
-                raise ValueError("invalid transaction journal")
-            namespace = _TransactionNamespace(
-                workspace_fd=workspace_fd,
-                root_fd=root_fd,
-                transaction_fd=transaction_fd,
-                transaction_id=transaction_id,
-                root_identity=root_identity,
-                transaction_identity=transaction_identity,
-            )
-            self._assert_transaction_namespace(workspace, namespace)
-            return namespace
-        except BaseException:
-            for descriptor in (transaction_fd, root_fd, workspace_fd):
-                if descriptor is not None:
-                    os.close(descriptor)
-            raise
 
     @staticmethod
     def _open_workspace_directory(workspace: Path) -> int:
@@ -494,117 +493,146 @@ class WorkspaceStore:
         return WorkspaceStore._identity(os.fstat(descriptor))
 
     @staticmethod
-    def _entry_matches(parent_fd: int, name: str, descriptor: int) -> bool:
+    def _entry_exists(parent_fd: int, name: str) -> bool:
         try:
-            current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         except FileNotFoundError:
             return False
-        return (
-            stat.S_ISDIR(current.st_mode)
-            and WorkspaceStore._identity(current)
-            == WorkspaceStore._descriptor_identity(descriptor)
-        )
+        return True
 
-    def _assert_transaction_namespace(
-        self, workspace: Path, namespace: _TransactionNamespace
-    ) -> None:
-        current_workspace = os.stat(workspace, follow_symlinks=False)
-        if self._identity(current_workspace) != self._descriptor_identity(namespace.workspace_fd):
-            raise ValueError("unsafe transaction staging namespace")
-        if namespace.root_fd is None:
-            try:
-                os.stat(".transactions", dir_fd=namespace.workspace_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                return
-            raise ValueError("unsafe transaction staging namespace")
-        if not self._entry_matches(
-            namespace.workspace_fd, ".transactions", namespace.root_fd
-        ):
-            raise ValueError("unsafe transaction staging namespace")
-        if namespace.transaction_fd is None:
-            try:
-                os.stat(
-                    namespace.transaction_id,
-                    dir_fd=namespace.root_fd,
-                    follow_symlinks=False,
-                )
-            except FileNotFoundError:
-                return
-            raise ValueError("unsafe transaction staging namespace")
-        if not self._entry_matches(
-            namespace.root_fd, namespace.transaction_id, namespace.transaction_fd
-        ):
-            raise ValueError("unsafe transaction staging namespace")
+    @staticmethod
+    def _stage_name(transaction_id: str, index: int) -> str:
+        return f"{_TRANSACTION_STAGE_PREFIX}{transaction_id}-{index}.stage"
 
-    def _validate_transaction_namespace_contents(
-        self, namespace: _TransactionNamespace, expected_stages: set[str]
-    ) -> None:
-        if namespace.root_fd is None:
-            return
-        root_entries = set(os.listdir(namespace.root_fd))
-        expected_root_entries = (
-            {namespace.transaction_id} if namespace.transaction_fd is not None else set()
-        )
-        if root_entries != expected_root_entries:
+    @staticmethod
+    def _journal_stage_name(transaction_id: str) -> str:
+        return f"{_TRANSACTION_STAGE_PREFIX}{transaction_id}-journal.stage"
+
+    def _reject_unowned_stage_entries(self, workspace_fd: int) -> None:
+        if any(name.startswith(_TRANSACTION_STAGE_PREFIX) for name in os.listdir(workspace_fd)):
+            raise ValueError("unexpected transaction stage")
+
+    def _journal_stage_identities(
+        self, transaction_id: str, entries: list[object], target_count: int
+    ) -> dict[str, tuple[int, int]]:
+        if len(entries) != target_count:
             raise ValueError("invalid transaction journal")
-        if namespace.transaction_fd is None:
-            return
-        transaction_entries = set(os.listdir(namespace.transaction_fd))
-        if not transaction_entries.issubset(expected_stages):
-            raise ValueError("invalid transaction journal")
-        for name in transaction_entries:
-            entry = os.stat(name, dir_fd=namespace.transaction_fd, follow_symlinks=False)
-            if not stat.S_ISREG(entry.st_mode):
+        identities: dict[str, tuple[int, int]] = {}
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
                 raise ValueError("invalid transaction journal")
+            name = entry.get("name")
+            device = entry.get("device")
+            inode = entry.get("inode")
+            if (
+                name != self._stage_name(transaction_id, index)
+                or not isinstance(device, int)
+                or not isinstance(inode, int)
+            ):
+                raise ValueError("invalid transaction journal")
+            identities[name] = (device, inode)
+        return identities
 
-    def _cleanup_transaction_namespace(
-        self, namespace: _TransactionNamespace, expected_stages: set[str]
+    def _cleanup_journal_stages(
+        self, workspace_fd: int, identities: dict[str, tuple[int, int]]
     ) -> None:
-        self._validate_transaction_namespace_contents(namespace, expected_stages)
-        if namespace.transaction_fd is not None:
-            for name in os.listdir(namespace.transaction_fd):
-                self._unlink_transaction_entry(namespace.transaction_fd, name)
-            if os.listdir(namespace.transaction_fd):
-                raise OSError("transaction staging cleanup incomplete")
-            if not self._entry_matches(
-                namespace.root_fd, namespace.transaction_id, namespace.transaction_fd
-            ):
-                raise OSError("transaction staging cleanup incomplete")
-            self._remove_transaction_directory(namespace.root_fd, namespace.transaction_id)
-        if namespace.root_fd is not None:
-            if os.listdir(namespace.root_fd):
-                raise OSError("transaction staging cleanup incomplete")
-            if not self._entry_matches(
-                namespace.workspace_fd, ".transactions", namespace.root_fd
-            ):
-                raise OSError("transaction staging cleanup incomplete")
-            self._remove_transaction_directory(namespace.workspace_fd, ".transactions")
+        for name, identity in identities.items():
+            if self._entry_exists(workspace_fd, name):
+                self._unlink_matching_entry(workspace_fd, name, identity)
+
+    def _cleanup_staged_files(
+        self, workspace_fd: int, stages: list[_StagedFile]
+    ) -> None:
+        for stage in stages:
+            if self._entry_exists(workspace_fd, stage.name):
+                self._unlink_matching_entry(workspace_fd, stage.name, stage.identity)
+
+    def _unlink_matching_entry(
+        self, workspace_fd: int, name: str, identity: tuple[int, int]
+    ) -> None:
+        entry = os.stat(name, dir_fd=workspace_fd, follow_symlinks=False)
+        if not stat.S_ISREG(entry.st_mode) or self._identity(entry) != identity:
+            raise OSError(f"transaction staging cleanup incomplete: {name}")
+        self._unlink_stage_entry(workspace_fd, name)
+        if self._entry_exists(workspace_fd, name):
+            raise OSError(f"transaction staging cleanup incomplete: {name}")
+
+    @staticmethod
+    def _unlink_stage_entry(workspace_fd: int, name: str) -> None:
+        os.unlink(name, dir_fd=workspace_fd)
+
+    def _write_transaction_journal(
+        self, workspace_fd: int, transaction_id: str, value: dict[str, object]
+    ) -> tuple[int, int]:
+        temporary = self._stage_bytes(
+            workspace_fd,
+            self._journal_stage_name(transaction_id),
+            self._json_bytes(value),
+        )
         try:
-            os.stat(".transactions", dir_fd=namespace.workspace_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            return
-        raise OSError("transaction staging cleanup incomplete")
+            if self._entry_exists(workspace_fd, _TRANSACTION_JOURNAL):
+                raise ValueError("invalid transaction journal")
+            self._assert_stage_entry(workspace_fd, temporary)
+            os.link(
+                temporary.name,
+                _TRANSACTION_JOURNAL,
+                src_dir_fd=workspace_fd,
+                dst_dir_fd=workspace_fd,
+                follow_symlinks=False,
+            )
+            journal = os.stat(
+                _TRANSACTION_JOURNAL,
+                dir_fd=workspace_fd,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISREG(journal.st_mode) or self._identity(journal) != temporary.identity:
+                raise ValueError("invalid transaction journal")
+            self._unlink_matching_entry(
+                workspace_fd, temporary.name, temporary.identity
+            )
+            os.fsync(workspace_fd)
+            return temporary.identity
+        finally:
+            temporary.close()
 
     @staticmethod
-    def _unlink_transaction_entry(transaction_fd: int, name: str) -> None:
-        os.unlink(name, dir_fd=transaction_fd)
-
-    @staticmethod
-    def _remove_transaction_directory(parent_fd: int, name: str) -> None:
-        os.rmdir(name, dir_fd=parent_fd)
+    def _read_json_entry(
+        workspace_fd: int,
+        name: str,
+        *,
+        expected_identity: tuple[int, int] | None = None,
+    ) -> object:
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=workspace_fd)
+        try:
+            status = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(status.st_mode)
+                or expected_identity is not None
+                and WorkspaceStore._identity(status) != expected_identity
+            ):
+                raise ValueError("invalid transaction journal")
+            with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+                descriptor = -1
+                return json.load(handle)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
 
     def _transaction_target(self, workspace: Path, relative: str) -> Path:
         candidate = Path(relative)
-        if not relative or candidate.is_absolute() or relative.startswith(".transactions/"):
+        if (
+            not relative
+            or candidate.is_absolute()
+            or any(part in {"", ".", ".."} for part in candidate.parts)
+        ):
             raise ValueError("invalid transaction journal")
-        target = (workspace / candidate).resolve()
-        try:
-            rendered = target.relative_to(workspace)
-        except ValueError as exc:
-            raise ValueError("invalid transaction journal") from exc
-        if rendered.parts and rendered.parts[0] in {".transaction.json", ".transactions"}:
+        if any(
+            part in {_TRANSACTION_JOURNAL, ".transactions"}
+            or part.startswith(_TRANSACTION_STAGE_PREFIX)
+            for part in candidate.parts
+        ):
             raise ValueError("invalid transaction journal")
-        return target
+        return workspace.joinpath(*candidate.parts)
 
     def _transaction_directory(self, workspace: Path, relative: str) -> Path:
         directory = self._transaction_target(workspace, relative)
@@ -614,13 +642,35 @@ class WorkspaceStore:
             raise ValueError("invalid transaction journal")
         return directory
 
+    def _cleanup_created_directories(
+        self, workspace_fd: int, created_directories: list[str]
+    ) -> None:
+        for relative in reversed(created_directories):
+            parent_fd, name = self._open_target_parent(
+                workspace_fd, relative, create=False
+            )
+            if parent_fd is None:
+                continue
+            try:
+                try:
+                    entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISDIR(entry.st_mode):
+                    raise OSError(
+                        f"transaction-created directory cleanup incomplete: {relative}"
+                    )
+                self._remove_created_directory(parent_fd, name)
+                if self._entry_exists(parent_fd, name):
+                    raise OSError(
+                        f"transaction-created directory cleanup incomplete: {relative}"
+                    )
+            finally:
+                os.close(parent_fd)
+
     @staticmethod
-    def _cleanup_created_directories(created_directories: list[Path]) -> None:
-        for directory in reversed(created_directories):
-            if directory.exists():
-                directory.rmdir()
-            if directory.exists() or directory.is_symlink():
-                raise OSError(f"transaction-created directory cleanup incomplete: {directory}")
+    def _remove_created_directory(parent_fd: int, name: str) -> None:
+        os.rmdir(name, dir_fd=parent_fd)
 
     @staticmethod
     def _missing_parent_dirs(workspace: Path, targets: dict[Path, bytes]) -> list[Path]:
@@ -661,13 +711,17 @@ class WorkspaceStore:
         candidate = Path(relative)
         if not relative or candidate.is_absolute():
             raise ValueError("artifact path must be relative")
+        if any(
+            part in {_TRANSACTION_JOURNAL, ".transactions"}
+            or part.startswith(_TRANSACTION_STAGE_PREFIX)
+            for part in candidate.parts
+        ):
+            raise ValueError("artifact path is reserved")
         target = (workspace / candidate).resolve()
         try:
             rendered = target.relative_to(workspace)
         except ValueError as exc:
             raise ValueError("artifact path escapes workspace") from exc
-        if rendered.parts and rendered.parts[0] in {".transaction.json", ".transactions"}:
-            raise ValueError("artifact path is reserved")
         if target == workspace or target.name in {
             "meta.json", "goal.yaml", "plan.yaml", "state.json", "events.jsonl"
         }:
@@ -694,38 +748,158 @@ class WorkspaceStore:
     def _json_bytes(value: object) -> bytes:
         return (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
-    @staticmethod
-    def _stage_bytes(transaction_fd: int | None, name: str, body: bytes) -> str:
-        if transaction_fd is None:
-            raise ValueError("unsafe transaction staging namespace")
+    def _stage_bytes(self, workspace_fd: int, name: str, body: bytes) -> _StagedFile:
+        if (
+            _TRANSACTION_STAGE.fullmatch(name) is None
+            and not re.fullmatch(r"\.twin-txn-[0-9a-f]{32}-journal\.stage", name)
+        ):
+            raise ValueError("invalid transaction stage name")
         descriptor = os.open(
             name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
             0o600,
-            dir_fd=transaction_fd,
+            dir_fd=workspace_fd,
         )
         try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(body)
-                handle.flush()
-                os.fsync(handle.fileno())
+            remaining = memoryview(body)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+            stage = _StagedFile(
+                name=name,
+                descriptor=descriptor,
+                identity=self._descriptor_identity(descriptor),
+            )
+            self._assert_stage_entry(workspace_fd, stage)
+            return stage
         except BaseException:
             try:
-                os.unlink(name, dir_fd=transaction_fd)
-            except FileNotFoundError:
+                entry = os.stat(name, dir_fd=workspace_fd, follow_symlinks=False)
+                opened = os.fstat(descriptor)
+                if stat.S_ISREG(entry.st_mode) and self._identity(entry) == self._identity(opened):
+                    os.unlink(name, dir_fd=workspace_fd)
+            except (FileNotFoundError, OSError):
                 pass
+            os.close(descriptor)
             raise
-        return name
 
-    @staticmethod
+    def _assert_stage_entry(self, workspace_fd: int, stage: _StagedFile) -> None:
+        current = os.stat(stage.name, dir_fd=workspace_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or self._identity(current) != stage.identity
+            or self._descriptor_identity(stage.descriptor) != stage.identity
+        ):
+            raise ValueError("transaction stage was replaced")
+
     def _publish_staged(
-        staged: dict[Path, str],
+        self,
+        staged: dict[Path, _StagedFile],
         previous: dict[Path, bytes | None],
         state_path: Path,
-        transaction_fd: int | None,
+        workspace_fd: int,
     ) -> None:
-        if transaction_fd is None:
-            raise ValueError("unsafe transaction staging namespace")
         ordered = [target for target in staged if target != state_path] + [state_path]
         for target in ordered:
-            os.replace(staged[target], target, src_dir_fd=transaction_fd)
+            stage = staged[target]
+            self._assert_stage_entry(workspace_fd, stage)
+            relative = str(target.relative_to(state_path.parent))
+            parent_fd, name = self._open_target_parent(
+                workspace_fd, relative, create=True
+            )
+            assert parent_fd is not None
+            try:
+                os.replace(
+                    stage.name,
+                    name,
+                    src_dir_fd=workspace_fd,
+                    dst_dir_fd=parent_fd,
+                )
+            finally:
+                os.close(parent_fd)
+
+    def _read_target_bytes(self, workspace_fd: int, relative: str) -> bytes | None:
+        parent_fd, name = self._open_target_parent(workspace_fd, relative, create=False)
+        if parent_fd is None:
+            return None
+        try:
+            try:
+                descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+            except FileNotFoundError:
+                return None
+            try:
+                status = os.fstat(descriptor)
+                if not stat.S_ISREG(status.st_mode):
+                    raise ValueError("unsafe transaction target")
+                with os.fdopen(descriptor, "rb") as handle:
+                    descriptor = -1
+                    return handle.read()
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+        finally:
+            os.close(parent_fd)
+
+    def _restore_target_bytes(
+        self, workspace_fd: int, relative: str, body: bytes | None
+    ) -> None:
+        parent_fd, name = self._open_target_parent(
+            workspace_fd, relative, create=body is not None
+        )
+        if parent_fd is None:
+            return
+        try:
+            if body is None:
+                try:
+                    entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    return
+                if not stat.S_ISREG(entry.st_mode):
+                    raise ValueError("unsafe transaction target")
+                os.unlink(name, dir_fd=parent_fd)
+                return
+            descriptor = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=parent_fd,
+            )
+            try:
+                remaining = memoryview(body)
+                while remaining:
+                    written = os.write(descriptor, remaining)
+                    remaining = remaining[written:]
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        finally:
+            os.close(parent_fd)
+
+    def _open_target_parent(
+        self, workspace_fd: int, relative: str, *, create: bool
+    ) -> tuple[int | None, str]:
+        candidate = Path(relative)
+        if (
+            not relative
+            or candidate.is_absolute()
+            or any(part in {"", ".", ".."} for part in candidate.parts)
+        ):
+            raise ValueError("unsafe transaction target")
+        current = os.dup(workspace_fd)
+        try:
+            for part in candidate.parts[:-1]:
+                try:
+                    child = self._open_directory_entry(current, part)
+                except FileNotFoundError:
+                    if not create:
+                        os.close(current)
+                        return None, candidate.name
+                    os.mkdir(part, 0o700, dir_fd=current)
+                    child = self._open_directory_entry(current, part)
+                os.close(current)
+                current = child
+            return current, candidate.name
+        except BaseException:
+            os.close(current)
+            raise
