@@ -7,20 +7,23 @@ import sys
 
 from twin.paths import TwinPaths
 from twin.resources import ResourceCatalog
+from twin.setup import check_skill_links
 
 
 def doctor_report(paths: TwinPaths, resources: ResourceCatalog) -> dict[str, object]:
     """Return installation health without treating provider availability as fatal."""
+    skill_links = {
+        link.name: link.as_dict()
+        for link in check_skill_links(paths, paths.root.parent)
+    }
     checks = {
         "python": _python_check(),
         "package_resources": _package_resources_check(resources),
         "state_home": _state_home_check(paths),
-        "cursor_skill": _skill_link_check(paths, ".cursor/skills/twin", resources),
-        "claude_skill": _skill_link_check(paths, ".claude/skills/twin", resources),
-        "codex_skill": _skill_link_check(paths, ".codex/skills/twin", resources),
-        "antigravity_skill": _skill_link_check(
-            paths, ".gemini/antigravity-cli/skills/twin", resources
-        ),
+        "cursor_skill": skill_links["cursor_skill"],
+        "claude_skill": skill_links["claude_skill"],
+        "codex_skill": skill_links["codex_skill"],
+        "antigravity_skill": skill_links["antigravity_skill"],
         "git": _executable_check("git"),
         "claude": _executable_check("claude"),
         "codex": _executable_check("codex"),
@@ -69,25 +72,6 @@ def _state_home_check(paths: TwinPaths) -> dict[str, object]:
     except OSError as exc:
         return {"ok": False, "detail": str(exc)}
     return {"ok": True, "detail": str(paths.root)}
-
-
-def _skill_link_check(
-    paths: TwinPaths, relative: str, resources: ResourceCatalog
-) -> dict[str, object]:
-    target = paths.root.parent / relative
-    try:
-        resource = resources.skill_dir().resolve()
-    except FileNotFoundError as exc:
-        return {"ok": False, "detail": str(exc)}
-    if not target.is_symlink():
-        return {"ok": False, "detail": f"missing skill link: {target}"}
-    try:
-        linked = target.resolve(strict=True)
-    except OSError as exc:
-        return {"ok": False, "detail": str(exc)}
-    if linked != resource:
-        return {"ok": False, "detail": f"skill link points elsewhere: {target}"}
-    return {"ok": True, "detail": str(target)}
 
 
 def _executable_check(name: str) -> dict[str, object]:

@@ -14,6 +14,7 @@ from twin.paths import TwinPaths
 from twin.resources import ResourceCatalog
 from twin.runtime.local_cli import LocalCliRuntime
 from twin.runtime.worktree import GitWorkspaceIsolation
+from twin.setup import LinkResult, check_skill_links, install_skill, uninstall_skill
 from twin.storage.workspaces import WorkspaceStore
 
 
@@ -38,7 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="command",
         required=True,
         action=_VisibleSubparsersAction,
-        metavar="{start,run,status,respond,handoff,doctor,contract}",
+        metavar="{start,run,status,respond,handoff,doctor,contract,setup,uninstall}",
     )
 
     def add_command(
@@ -124,6 +125,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_json_flag(contract, required=True)
 
+    setup = add_command(
+        "setup", visibility="administrative", argv=["setup", "[--check]", "[--json]"],
+        output={"shape": "setup-report"}, help_text="install or check the host skill",
+    )
+    setup.add_argument("--check", action="store_true")
+    _add_json_flag(setup)
+
+    uninstall = add_command(
+        "uninstall", visibility="administrative", argv=["uninstall", "[--json]"],
+        output={"shape": "uninstall-report"}, help_text="remove Twin-owned host skill links",
+    )
+    _add_json_flag(uninstall)
+
     _add_submission_command(
         add_command, "submit-plan",
         ["submit-plan", "--workspace", "<id>", "--supervisor", "host/<provider>",
@@ -178,6 +192,13 @@ def _dispatch(
         return render_contract(build_parser(), resources)
     if command == "doctor":
         return doctor_report(paths, resources)
+    if command == "setup":
+        links = check_skill_links(paths, paths.root.parent) if args.check else install_skill(
+            paths, resources, paths.root.parent
+        )
+        return _link_report(links)
+    if command == "uninstall":
+        return _link_report(uninstall_skill(paths, paths.root.parent))
     service = _service(paths, resources)
     repo_root = Path.cwd()
     if command == "start":
@@ -275,3 +296,10 @@ def _emit(result: dict[str, object], *, as_json: bool) -> None:
         value = result[key]
         rendered = json.dumps(value, ensure_ascii=False, sort_keys=True)
         print(f"{key}: {rendered}")
+
+
+def _link_report(links: Sequence[LinkResult]) -> dict[str, object]:
+    return {
+        "ok": all(link.ok for link in links),
+        "links": {link.name: link.as_dict() for link in links},
+    }

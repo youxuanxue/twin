@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -7,6 +6,7 @@ from unittest.mock import patch
 from twin.doctor import doctor_report
 from twin.paths import TwinPaths
 from twin.resources import ResourceCatalog
+from twin.setup import install_skill
 
 
 class DoctorReportTest(TestCase):
@@ -15,15 +15,7 @@ class DoctorReportTest(TestCase):
             home = Path(raw) / "home"
             paths = TwinPaths.for_home(home)
             resources = ResourceCatalog(Path(__file__).resolve().parents[1])
-            for relative in (
-                ".cursor/skills/twin",
-                ".claude/skills/twin",
-                ".codex/skills/twin",
-                ".gemini/antigravity-cli/skills/twin",
-            ):
-                target = home / relative
-                target.parent.mkdir(parents=True, exist_ok=True)
-                os.symlink(resources.skill_dir(), target)
+            install_skill(paths, resources, home)
 
             with patch("twin.doctor.shutil.which", side_effect=lambda name: "/usr/bin/git" if name == "git" else None):
                 report = doctor_report(paths, resources)
