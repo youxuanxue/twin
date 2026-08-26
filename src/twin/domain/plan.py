@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from typing import Callable
 
 
 ITEM_STATUSES = frozenset({"pending", "in_progress", "completed", "blocked", "deferred"})
@@ -96,7 +97,9 @@ def apply_updates(plan: dict[str, object], updates: object) -> list[str]:
     return errors
 
 
-def acceptance_evidence(goal: dict[str, object], plan: dict[str, object]) -> dict[str, list[str]]:
+def acceptance_evidence(
+    goal: dict[str, object], plan: dict[str, object], has_evidence: Callable[[str], bool]
+) -> dict[str, list[str]]:
     result: dict[str, list[str]] = defaultdict(list)
     items = plan.get("items", [])
     if not isinstance(items, list):
@@ -104,12 +107,19 @@ def acceptance_evidence(goal: dict[str, object], plan: dict[str, object]) -> dic
     for item in items:
         if not isinstance(item, dict) or item.get("status") != "completed":
             continue
-        evidence = item.get("actual_evidence", [])
-        if not isinstance(evidence, list):
+        declared = item.get("evidence_plan", [])
+        actual = item.get("actual_evidence", [])
+        if not isinstance(declared, list) or not isinstance(actual, list):
             continue
         for ac_id in item.get("covers_ac", []):
             if isinstance(ac_id, str):
-                result[ac_id].extend(value for value in evidence if isinstance(value, str) and value not in result[ac_id])
+                result[ac_id].extend(
+                    value for value in actual
+                    if isinstance(value, str)
+                    and value in declared
+                    and has_evidence(value)
+                    and value not in result[ac_id]
+                )
     return dict(result)
 
 
@@ -131,7 +141,9 @@ def choose_next_item(plan: dict[str, object]) -> dict[str, object] | None:
     return None
 
 
-def completion_gaps(goal: dict[str, object], plan: dict[str, object], has_evidence: callable) -> list[str]:
+def completion_gaps(
+    goal: dict[str, object], plan: dict[str, object], has_evidence: Callable[[str], bool]
+) -> list[str]:
     gaps: list[str] = []
     items = plan.get("items", [])
     if not isinstance(items, list):
@@ -149,7 +161,17 @@ def completion_gaps(goal: dict[str, object], plan: dict[str, object], has_eviden
             gaps.append(f"{item_id}: dependencies not completed")
         declared = item.get("evidence_plan", [])
         actual = item.get("actual_evidence", [])
-        if not isinstance(declared, list) or not isinstance(actual, list) or not actual:
+        covers_ac = item.get("covers_ac", [])
+        if not isinstance(declared, list) or not isinstance(actual, list):
+            gaps.append(f"{item_id}: missing evidence")
+            continue
+        undeclared = [entry for entry in actual if entry not in declared]
+        if undeclared:
+            gaps.append(f"{item_id}: undeclared evidence")
+        if covers_ac and not declared:
+            gaps.append(f"{item_id}: missing evidence")
+            continue
+        if declared and not actual:
             gaps.append(f"{item_id}: missing evidence")
             continue
         missing = [entry for entry in declared if entry not in actual or not has_evidence(entry)]
@@ -159,7 +181,7 @@ def completion_gaps(goal: dict[str, object], plan: dict[str, object], has_eviden
         if not isinstance(criterion, dict):
             continue
         ac_id = str(criterion.get("id") or "")
-        if ac_id and not acceptance_evidence(goal, plan).get(ac_id):
+        if ac_id and not acceptance_evidence(goal, plan, has_evidence).get(ac_id):
             gaps.append(f"{ac_id}: missing accepted evidence")
     return gaps
 

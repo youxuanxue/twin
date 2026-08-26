@@ -13,7 +13,7 @@ from twin.domain.state import require_mutable, transition
 from twin.resources import ResourceCatalog
 from twin.schema import validate_document
 from twin.storage.workspaces import WorkspaceStore
-from twin.yaml_codec import dump_yaml, load_yaml
+from twin.yaml_codec import encode_yaml, load_yaml
 
 
 class TwinService:
@@ -62,12 +62,16 @@ class TwinService:
         require_mutable(state)
         validate_submission(state, kind="author_plan", route=route, revision=revision, token=token)
         goal, plan = self._validate_plan_payload(payload, str(state["workspace_id"]))
-        dump_yaml(workspace / "goal.yaml", goal)
-        dump_yaml(workspace / "plan.yaml", plan)
         transition(state, "ready")
         state["pending_action"] = None
-        self.store.replace_state(workspace, revision, state)
-        self.store.append_event(workspace, {"event": "plan_submitted", "details": {"route": route}})
+        self.store.commit_action(
+            workspace, revision, state,
+            documents={"goal.yaml": encode_yaml(goal), "plan.yaml": encode_yaml(plan)},
+            artifacts={}, event={"event": "plan_submitted", "details": {"route": route}},
+            validate_current=lambda current: self._validate_current_submission(
+                current, "author_plan", route, revision, token
+            ),
+        )
         return self._result(workspace, self._state(workspace))
 
     def submit_instruction(self, workspace_ref: str, route: str, revision: int, token: str, run_id: str, payload: dict[str, object]) -> dict[str, object]:
@@ -80,16 +84,27 @@ class TwinService:
         errors.extend(validate_plan(load_yaml(workspace / "goal.yaml"), plan))
         if errors:
             raise ValueError("; ".join(errors))
-        self._write_command_results(workspace, payload.get("command_results"), run_id)
+        command_artifacts = self._command_result_artifacts(payload.get("command_results"), run_id)
         goal = load_yaml(workspace / "goal.yaml")
-        gaps = completion_gaps(goal, plan, lambda entry: evidence_exists(workspace, entry))
-        completed_gaps = [gap for gap in gaps if gap.endswith("missing evidence")]
-        if completed_gaps:
-            raise ValueError("missing evidence")
-        dump_yaml(workspace / "plan.yaml", plan)
+        gaps = completion_gaps(
+            goal, plan, lambda entry: evidence_exists(workspace, entry, command_artifacts)
+        )
+        evidence_gaps = [
+            gap for gap in gaps
+            if gap.endswith("missing evidence") or gap.endswith("undeclared evidence")
+        ]
+        if evidence_gaps:
+            raise ValueError(evidence_gaps[0].split(": ", 1)[1])
         transition(state, "review_required")
         action = issue_action(state, kind="review", workspace=str(state["workspace_id"]), route=route, run_id=run_id)
-        self.store.replace_state(workspace, revision, state)
+        self.store.commit_action(
+            workspace, revision, state,
+            documents={"plan.yaml": encode_yaml(plan)}, artifacts=command_artifacts,
+            event={"event": "instruction_submitted", "details": {"route": route, "run_id": run_id}},
+            validate_current=lambda current: self._validate_current_submission(
+                current, "worker_instruction", route, revision, token, run_id
+            ),
+        )
         return action
 
     def submit_review(self, workspace_ref: str, route: str, revision: int, token: str, run_id: str, payload: dict[str, object]) -> dict[str, object]:
@@ -99,7 +114,10 @@ class TwinService:
         validate_submission(state, kind="review", route=route, revision=revision, token=token, run_id=run_id)
         decision = payload.get("decision")
         if decision == "accepted":
-            gaps = completion_gaps(load_yaml(workspace / "goal.yaml"), load_yaml(workspace / "plan.yaml"), lambda entry: evidence_exists(workspace, entry))
+            gaps = completion_gaps(
+                load_yaml(workspace / "goal.yaml"), load_yaml(workspace / "plan.yaml"),
+                lambda entry: evidence_exists(workspace, entry),
+            )
             if gaps:
                 raise ValueError("missing evidence")
             transition(state, "accepted_done")
@@ -182,6 +200,16 @@ class TwinService:
         return state
 
     @staticmethod
+    def _validate_current_submission(
+        state: dict[str, object], kind: str, route: str, revision: int, token: str,
+        run_id: str | None = None,
+    ) -> None:
+        require_mutable(state)
+        validate_submission(
+            state, kind=kind, route=route, revision=revision, token=token, run_id=run_id
+        )
+
+    @staticmethod
     def _revision(state: dict[str, object]) -> int:
         revision = state.get("state_revision")
         if not isinstance(revision, int):
@@ -191,15 +219,19 @@ class TwinService:
     def _result(self, workspace: Path, state: dict[str, object]) -> dict[str, object]:
         return {"workspace": str(state["workspace_id"]), "status": state["status"], "state_revision": state["state_revision"], "supervisor_route": state["supervisor_route"]}
 
-    def _write_command_results(self, workspace: Path, results: object, run_id: str) -> None:
+    def _command_result_artifacts(self, results: object, run_id: str) -> dict[str, bytes]:
         if results is None:
-            return
+            return {}
         if not isinstance(results, list):
             raise ValueError("command_results must be a list")
+        artifacts: dict[str, bytes] = {}
         for result in results:
             if not isinstance(result, dict) or not isinstance(result.get("relative"), str) or not isinstance(result.get("exit_code"), int):
                 raise ValueError("invalid command result")
             relative = result["relative"]
             if not relative.startswith(f"artifacts/runs/{run_id}/"):
                 raise ValueError("command result artifact must be bound to run")
-            self.store.write_artifact(workspace, relative, json.dumps({"exit_code": result["exit_code"]}, sort_keys=True).encode("utf-8"))
+            artifacts[relative] = json.dumps(
+                {"exit_code": result["exit_code"]}, sort_keys=True
+            ).encode("utf-8")
+        return artifacts

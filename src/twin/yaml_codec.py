@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from twin.storage.atomic import write_text
+from twin.storage.atomic import write_bytes
 
 
 def load_yaml(path: Path) -> dict[str, object]:
@@ -20,7 +20,11 @@ def load_yaml(path: Path) -> dict[str, object]:
 
 
 def dump_yaml(path: Path, value: dict[str, object]) -> None:
-    write_text(path, _dump_simple_yaml(value))
+    write_bytes(path, encode_yaml(value))
+
+
+def encode_yaml(value: dict[str, object]) -> bytes:
+    return _dump_simple_yaml(value).encode("utf-8")
 
 
 def _line_indent(raw: str) -> int:

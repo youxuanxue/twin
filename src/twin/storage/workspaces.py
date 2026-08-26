@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import secrets
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from twin.paths import TwinPaths
 from twin.storage.atomic import write_bytes, write_text
@@ -147,6 +150,81 @@ class WorkspaceStore:
         self.append_event(workspace, {"event": "artifact_written", "details": metadata})
         return metadata
 
+    def commit_action(
+        self,
+        workspace: Path,
+        expected_revision: int,
+        value: dict[str, object],
+        *,
+        documents: dict[str, bytes],
+        artifacts: dict[str, bytes],
+        event: dict[str, object],
+        validate_current: Callable[[dict[str, object]], None],
+    ) -> None:
+        """Publish an action's documents, artifacts, state, and events under one workspace lock."""
+        workspace = self._workspace_path(workspace)
+        with self._lock(workspace):
+            current = self.load_state(workspace)
+            revision = current.get("state_revision")
+            if revision != expected_revision:
+                raise ValueError(
+                    f"state revision mismatch: expected {expected_revision}, found {revision}"
+                )
+            validate_current(current)
+            if value.get("workspace_id") != current.get("workspace_id"):
+                raise ValueError("state workspace_id mismatch")
+            workspace_id = current.get("workspace_id")
+            if not isinstance(workspace_id, str):
+                raise ValueError("state workspace_id mismatch")
+            targets: dict[Path, bytes] = {}
+            for relative, body in documents.items():
+                if relative not in {"goal.yaml", "plan.yaml"}:
+                    raise ValueError("document path is not writable")
+                targets[workspace / relative] = body
+            artifact_metadata: list[dict[str, object]] = []
+            for relative, body in artifacts.items():
+                target = self._artifact_path(workspace, relative)
+                targets[target] = body
+                artifact_metadata.append({
+                    "relative": str(target.relative_to(workspace)),
+                    "sha256": hashlib.sha256(body).hexdigest(),
+                    "bytes": len(body),
+                })
+            next_revision = expected_revision + 1
+            next_state = dict(value)
+            next_state["state_revision"] = next_revision
+            targets[workspace / "state.json"] = self._json_bytes(next_state)
+            records = [
+                event_record(
+                    workspace_id=workspace_id,
+                    state_revision=next_revision,
+                    event={"event": "state_replaced", "details": {}},
+                ),
+                *[
+                    event_record(
+                        workspace_id=workspace_id,
+                        state_revision=next_revision,
+                        event={"event": "artifact_written", "details": metadata},
+                    )
+                    for metadata in artifact_metadata
+                ],
+                event_record(
+                    workspace_id=workspace_id, state_revision=next_revision, event=event
+                ),
+            ]
+            prior_events = (workspace / "events.jsonl").read_bytes()
+            targets[workspace / "events.jsonl"] = prior_events + b"".join(
+                json.dumps(record, ensure_ascii=False, sort_keys=True).encode("utf-8") + b"\n"
+                for record in records
+            )
+            staged = {target: self._stage_bytes(target, body) for target, body in targets.items()}
+            previous = {target: target.read_bytes() if target.exists() else None for target in targets}
+            try:
+                self._publish_staged(staged, previous, workspace / "state.json")
+            finally:
+                for temporary in staged.values():
+                    temporary.unlink(missing_ok=True)
+
     def _new_workspace_id(self, request: str) -> str:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         slug = re.sub(r"[^a-z0-9]+", "-", request.lower()).strip("-")[:48] or "workspace"
@@ -201,4 +279,44 @@ class WorkspaceStore:
 
     @staticmethod
     def _write_json(path: Path, value: object) -> None:
-        write_text(path, json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        write_text(path, WorkspaceStore._json_bytes(value).decode("utf-8"))
+
+    @staticmethod
+    def _json_bytes(value: object) -> bytes:
+        return (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+    @staticmethod
+    def _stage_bytes(target: Path, body: bytes) -> Path:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, raw_temporary = tempfile.mkstemp(
+            dir=target.parent, prefix=f".{target.name}.", suffix=".tmp"
+        )
+        temporary = Path(raw_temporary)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+        return temporary
+
+    @staticmethod
+    def _publish_staged(
+        staged: dict[Path, Path], previous: dict[Path, bytes | None], state_path: Path
+    ) -> None:
+        published: list[Path] = []
+        ordered = [target for target in staged if target != state_path] + [state_path]
+        try:
+            for target in ordered:
+                os.replace(staged[target], target)
+                published.append(target)
+        except BaseException:
+            for target in reversed(published):
+                old = previous[target]
+                if old is None:
+                    target.unlink(missing_ok=True)
+                else:
+                    write_bytes(target, old)
+            raise

@@ -2,6 +2,7 @@ import hashlib
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 from unittest import TestCase
 
 from twin.domain.service import TwinService
@@ -176,6 +177,74 @@ class TwinServiceTest(TestCase):
             {"decision": "accepted"},
         )
         self.assertEqual(result["status"], "accepted_done")
+
+    def test_undeclared_stored_evidence_cannot_complete_an_acceptance_criterion(self) -> None:
+        self.start_and_submit_plan()
+        run = self.service.run(None, self.repo, "host/codex")
+        workspace = self.store.resolve(str(run["workspace"]), self.repo)
+        self.store.write_artifact(workspace, "artifacts/undeclared.txt", b"verified")
+        with self.assertRaisesRegex(ValueError, "undeclared evidence"):
+            self.service.submit_instruction(
+                run["workspace"], "host/codex", run["state_revision"], run["action_token"],
+                run["context"]["metadata"]["run_id"],
+                {"updates": [{"item_id": "implement", "status": "completed", "actual_evidence": ["artifacts/undeclared.txt"]}]},
+            )
+
+    def test_ac_bearing_item_with_an_empty_evidence_plan_cannot_complete(self) -> None:
+        action = self.service.start("ship feature", self.repo, "host/codex")
+        payload = valid_goal_and_plan()
+        plan = payload["plan"]
+        assert isinstance(plan, dict)
+        items = plan["items"]
+        assert isinstance(items, list)
+        item = items[0]
+        assert isinstance(item, dict)
+        item["evidence_plan"] = []
+        self.service.submit_plan(action["workspace"], "host/codex", action["state_revision"], action["action_token"], payload)
+        run = self.service.run(None, self.repo, "host/codex")
+        with self.assertRaisesRegex(ValueError, "missing evidence"):
+            self.service.submit_instruction(
+                run["workspace"], "host/codex", run["state_revision"], run["action_token"],
+                run["context"]["metadata"]["run_id"],
+                {"updates": [{"item_id": "implement", "status": "completed", "actual_evidence": []}]},
+            )
+
+    def test_plan_commit_failure_leaves_documents_state_and_token_unchanged(self) -> None:
+        action = self.service.start("ship feature", self.repo, "host/codex")
+        workspace = self.store.resolve(str(action["workspace"]), self.repo)
+        before = {
+            name: (workspace / name).read_bytes()
+            for name in ("goal.yaml", "plan.yaml", "state.json", "events.jsonl")
+        }
+        with patch.object(self.store, "_publish_staged", side_effect=OSError("injected"), create=True):
+            with self.assertRaisesRegex(OSError, "injected"):
+                self.service.submit_plan(
+                    action["workspace"], "host/codex", action["state_revision"], action["action_token"], valid_goal_and_plan()
+                )
+        self.assertEqual({name: (workspace / name).read_bytes() for name in before}, before)
+        self.assertEqual(
+            self.service.submit_plan(
+                action["workspace"], "host/codex", action["state_revision"], action["action_token"], valid_goal_and_plan()
+            )["status"],
+            "ready",
+        )
+
+    def test_stale_competing_plan_submission_cannot_overwrite_winner_documents(self) -> None:
+        action = self.service.start("ship feature", self.repo, "host/codex")
+        winner = valid_goal_and_plan()
+        winner_goal = winner["goal"]
+        assert isinstance(winner_goal, dict)
+        winner_goal["one_liner"] = "Winner plan"
+        self.service.submit_plan(action["workspace"], "host/codex", action["state_revision"], action["action_token"], winner)
+        loser = valid_goal_and_plan()
+        loser_goal = loser["goal"]
+        assert isinstance(loser_goal, dict)
+        loser_goal["one_liner"] = "Loser plan"
+        with self.assertRaisesRegex(ValueError, "stale or consumed action"):
+            self.service.submit_plan(action["workspace"], "host/codex", action["state_revision"], action["action_token"], loser)
+        workspace = self.store.resolve(str(action["workspace"]), self.repo)
+        self.assertIn("Winner plan", (workspace / "goal.yaml").read_text(encoding="utf-8"))
+        self.assertNotIn("Loser plan", (workspace / "goal.yaml").read_text(encoding="utf-8"))
 
     def test_terminal_workspace_cannot_mutate(self) -> None:
         action = self.service.start("ship feature", self.repo, "host/codex")
