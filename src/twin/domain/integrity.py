@@ -35,7 +35,9 @@ def validate_workspace_integrity(
 ) -> WorkspaceSnapshot:
     workspace = workspace.resolve()
     meta = _json_document(workspace / "meta.json", "meta", resources)
-    state = _json_document(workspace / "state.json", "state", resources)
+    state, state_body = _json_document_with_body(
+        workspace / "state.json", "state", resources
+    )
     goal = _yaml_document(workspace / "goal.yaml", "goal", resources)
     plan = _yaml_document(workspace / "plan.yaml", "plan", resources)
     workspace_id = workspace.name
@@ -59,7 +61,13 @@ def validate_workspace_integrity(
         if ready_errors:
             raise ValueError("invalid ready workspace: " + "; ".join(ready_errors))
 
-    events = _event_stream(workspace / "events.jsonl", workspace_id, state, resources)
+    events = _event_stream(
+        workspace / "events.jsonl",
+        workspace_id,
+        state,
+        hashlib.sha256(state_body).hexdigest(),
+        resources,
+    )
     artifacts = _artifact_index(workspace, events)
     requests, results, evidence = _run_records(
         workspace,
@@ -95,14 +103,22 @@ def validate_workspace_integrity(
 def _json_document(
     path: Path, schema_name: str, resources: ResourceCatalog
 ) -> dict[str, object]:
+    value, _ = _json_document_with_body(path, schema_name, resources)
+    return value
+
+
+def _json_document_with_body(
+    path: Path, schema_name: str, resources: ResourceCatalog
+) -> tuple[dict[str, object], bytes]:
     try:
-        value = json.loads(_read_regular(path).decode("utf-8"))
+        body = _read_regular(path)
+        value = json.loads(body.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"invalid {schema_name}") from exc
     errors = validate_document(value, schema_name, resources)
     if not isinstance(value, dict) or errors:
         raise ValueError(f"invalid {schema_name}: {'; '.join(errors)}")
-    return value
+    return value, body
 
 
 def _yaml_document(
@@ -122,6 +138,7 @@ def _event_stream(
     path: Path,
     workspace_id: str,
     state: dict[str, object],
+    state_sha256: str,
     resources: ResourceCatalog,
 ) -> list[dict[str, object]]:
     try:
@@ -151,6 +168,22 @@ def _event_stream(
         raise ValueError("event revision mismatch")
     if sum(event.get("event") == "workspace_created" for event in events) != 1:
         raise ValueError("event revision mismatch")
+    state_bindings: dict[int, str] = {}
+    for event in events:
+        name = event.get("event")
+        revision = event.get("state_revision")
+        if name not in {"workspace_created", "state_replaced"}:
+            continue
+        details = event.get("details")
+        digest = details.get("sha256") if isinstance(details, dict) else None
+        if (
+            not isinstance(revision, int)
+            or not isinstance(digest, str)
+            or _SHA256.fullmatch(digest) is None
+            or revision in state_bindings
+        ):
+            raise ValueError("state event binding mismatch")
+        state_bindings[revision] = digest
     for revision in range(1, state_revision + 1):
         replaced = sum(
             event.get("event") == "state_replaced" and event.get("state_revision") == revision
@@ -158,6 +191,8 @@ def _event_stream(
         )
         if replaced != 1:
             raise ValueError("event revision mismatch")
+    if state_bindings.get(state_revision) != state_sha256:
+        raise ValueError("state event binding mismatch")
     return events
 
 

@@ -163,9 +163,34 @@ class WorkspaceStoreTest(TestCase):
                 "event": "state_replaced",
                 "workspace_id": replaced["workspace_id"],
                 "state_revision": 1,
-                "details": {},
+                "details": {
+                    "sha256": hashlib.sha256(
+                        (workspace / "state.json").read_bytes()
+                    ).hexdigest(),
+                },
                 "recorded_at": event["recorded_at"],
             })
+
+    def test_status_rejects_non_status_state_field_rewrite(self) -> None:
+        with TemporaryDirectory() as raw:
+            root = Path(raw)
+            repo = root / "repo"
+            repo.mkdir()
+            resources = ResourceCatalog(Path(__file__).resolve().parents[1])
+            store = WorkspaceStore(TwinPaths.for_home(root / "home"))
+            service = TwinService(store, resources=resources)
+            action = service.start("ship feature", repo, "host/codex")
+            workspace = store.resolve(str(action["workspace"]), repo)
+            state_path = workspace / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["metadata"] = {"forged": True}
+            state_path.write_text(
+                json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "state event binding mismatch"):
+                service.status(action["workspace"], repo)
 
     def test_action_context_rejects_unknown_fields(self) -> None:
         action = {
@@ -241,7 +266,7 @@ class WorkspaceStoreTest(TestCase):
                     state = json.loads((workspace / "state.json").read_text(encoding="utf-8"))
                     if corruption == "pending":
                         state["pending_action"] = None
-                        expected = "pending action invariant"
+                        expected = "state event binding mismatch"
                     else:
                         state["repository_identity"] = "0" * 64
                         expected = "repository identity mismatch"
@@ -409,7 +434,7 @@ class WorkspaceStoreTest(TestCase):
                 ("request_repository", "run request repository mismatch"),
                 ("request_item", "run request item mismatch"),
                 ("evidence_item", "run evidence item mismatch"),
-                ("state_item", "worker run item mismatch"),
+                ("state_item", "state event binding mismatch"),
             )
             for corruption, expected in cases:
                 with self.subTest(corruption=corruption):

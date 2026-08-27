@@ -694,6 +694,76 @@ class TwinServiceRuntimeIntegrationTest(TestCase):
                 {"decision": "accepted"},
             )
 
+    def test_state_only_rewrite_cannot_bypass_review_and_run_the_next_item(self) -> None:
+        runtime = _TwoItemRuntime()
+        service = TwinService(
+            self.store,
+            runtime=runtime,
+            isolation=self.isolation,
+            resources=self.resources,
+        )
+        payload = valid_goal_and_plan()
+        goal = payload["goal"]
+        plan = payload["plan"]
+        assert isinstance(goal, dict) and isinstance(plan, dict)
+        goal["acceptance_criteria"] = [
+            {"id": "ac-first", "statement": "First item works", "evidence_type": "artifact"},
+            {"id": "ac-second", "statement": "Second item works", "evidence_type": "artifact"},
+        ]
+        plan["items"] = [
+            {
+                "id": "first",
+                "deliverable": "First item",
+                "scope": "Only the first item",
+                "covers_ac": ["ac-first"],
+                "evidence_plan": ["artifacts/first.txt"],
+                "actual_evidence": [],
+                "depends_on": [],
+                "status": "pending",
+                "next_action": "Complete the first item",
+            },
+            {
+                "id": "second",
+                "deliverable": "Second item",
+                "scope": "Only the second item",
+                "covers_ac": ["ac-second"],
+                "evidence_plan": ["artifacts/second.txt"],
+                "actual_evidence": [],
+                "depends_on": ["first"],
+                "status": "pending",
+                "next_action": "Complete the second item",
+            },
+        ]
+        start = service.start("ship two items", self.repo, "host/codex")
+        ready = service.submit_plan(
+            start["workspace"], "host/codex", start["state_revision"],
+            start["action_token"], payload,
+        )
+        review = service.run(ready["workspace"], self.repo, "host/codex")
+        self.assertEqual(review["action"], "review")
+        self.assertEqual(runtime.item_ids, ["first"])
+
+        workspace = self.store.resolve(str(review["workspace"]), self.repo)
+        state_path = workspace / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["status"], "review_required")
+        state.update({
+            "status": "ready",
+            "pending_action": None,
+            "current_run_id": None,
+            "current_item_id": None,
+        })
+        state_path.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "state event binding mismatch"):
+            service.status(review["workspace"], self.repo)
+        with self.assertRaisesRegex(ValueError, "state event binding mismatch"):
+            service.run(review["workspace"], self.repo, "host/codex")
+        self.assertEqual(runtime.item_ids, ["first"])
+
     def test_run_recovers_the_same_worker_run_after_process_death(self) -> None:
         start = self.service.start("ship feature", self.repo, "host/codex")
         ready = self.service.submit_plan(
@@ -976,6 +1046,34 @@ class _DeterministicRuntime:
                     "relative": "artifacts/evidence.txt",
                     "content": "verified",
                 }],
+            },
+        )
+
+
+class _TwoItemRuntime:
+    def __init__(self) -> None:
+        self.item_ids: list[str] = []
+
+    def run_turn(self, request: WorkerTurnRequest) -> WorkerTurnResult:
+        match = re.search(r'"item_id": "(first|second)"', request.prompt)
+        if match is None:
+            raise ValueError("worker prompt is missing the two-item run context")
+        item_id = match.group(1)
+        self.item_ids.append(item_id)
+        relative = f"artifacts/{item_id}.txt"
+        return WorkerTurnResult(
+            output_text=f"completed {item_id}",
+            returncode=0,
+            session_id=f"{item_id}-session",
+            events=({"event": "completed"},),
+            submission={
+                "updates": [{
+                    "item_id": item_id,
+                    "status": "completed",
+                    "actual_evidence": [relative],
+                }],
+                "command_results": [],
+                "artifacts": [{"relative": relative, "content": "verified"}],
             },
         )
 

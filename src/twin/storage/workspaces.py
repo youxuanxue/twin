@@ -94,7 +94,8 @@ class WorkspaceStore:
             "items": [],
             "verification": [],
         })
-        self._write_json(workspace / "state.json", state)
+        state_body = self._json_bytes(state)
+        write_text(workspace / "state.json", state_body.decode("utf-8"))
         pointer = self.paths.active_workspaces / self._project_key(canonical_repo)
         write_text(pointer, workspace_id + "\n")
         append_jsonl(
@@ -104,7 +105,10 @@ class WorkspaceStore:
                 state_revision=0,
                 event={
                     "event": "workspace_created",
-                    "details": {"repository_identity": repository_identity},
+                    "details": {
+                        "repository_identity": repository_identity,
+                        "sha256": hashlib.sha256(state_body).hexdigest(),
+                    },
                 },
             ),
         )
@@ -294,12 +298,16 @@ class WorkspaceStore:
         next_revision = expected_revision + 1
         next_state = dict(value)
         next_state["state_revision"] = next_revision
-        targets[workspace / "state.json"] = self._json_bytes(next_state)
+        state_body = self._json_bytes(next_state)
+        targets[workspace / "state.json"] = state_body
         records: list[dict[str, object]] = [
             event_record(
                 workspace_id=workspace_id,
                 state_revision=next_revision,
-                event={"event": "state_replaced", "details": {}},
+                event={
+                    "event": "state_replaced",
+                    "details": {"sha256": hashlib.sha256(state_body).hexdigest()},
+                },
             ),
             *[
                 event_record(
